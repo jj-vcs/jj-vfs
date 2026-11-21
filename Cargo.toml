@@ -70,6 +70,7 @@ anyhow.workspace = true
 async-trait.workspace = true
 cc-common.workspace = true
 cc-lib.workspace = true
+clap.workspace = true
 dashmap.workspace = true
 fuser.workspace = true
 futures.workspace = true
@@ -81,6 +82,7 @@ jj-lib.workspace = true
 libc.workspace = true
 parking_lot.workspace = true
 pollster = { workspace = true, optional = true }
+serde_json.workspace = true
 tempfile = { workspace = true, optional = true }
 thiserror.workspace = true
 tokio.workspace = true

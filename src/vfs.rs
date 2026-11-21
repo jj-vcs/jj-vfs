@@ -17,16 +17,15 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use futures::io::AsyncReadExt as _;
 
 use crate::jj_error::JjError;
 use crate::path_mapper::PathMapper;
 use crate::virtual_file::DirectoryStream;
 use crate::virtual_file::FileAttributes;
 
-/// Middle-layer filesystem abstraction representing inode-based VFS operations.
-/// This trait acts as the intermediate layer between the FUSE filesystem layer
-/// and the path mapper.
+/// Middle-layer filesystem abstraction representing path-resolved VFS
+/// operations between the FUSE transport (`JjFuse`) and the `PathMapper` /
+/// overlay layers.
 #[async_trait]
 pub trait VirtualFilesystem {
     async fn get_attributes(&self, path: &Path) -> Result<FileAttributes, JjError>;
@@ -45,6 +44,10 @@ impl<P: PathMapper> PathMappedVfs<P> {
             path_mapper: Arc::new(path_mapper),
         }
     }
+
+    pub fn from_arc(path_mapper: Arc<P>) -> Self {
+        Self { path_mapper }
+    }
 }
 
 #[async_trait]
@@ -58,16 +61,7 @@ impl<P: PathMapper> VirtualFilesystem for PathMappedVfs<P> {
     #[tracing::instrument(skip(self))]
     async fn read(&self, path: &Path, offset: u64, size: u32) -> Result<Box<[u8]>, JjError> {
         let virtual_file = self.path_mapper.get_entry(path).await?;
-        let reader = virtual_file.read().await?;
-        let mut limited_stream = reader.take(offset); // TODO: handle proper seek()
-        futures::io::copy(&mut limited_stream, &mut futures::io::sink()).await?;
-        let original_reader = limited_stream.into_inner();
-        let mut content = Vec::with_capacity(size as usize);
-        original_reader
-            .take(size as u64)
-            .read_to_end(&mut content)
-            .await?;
-        Ok(content.into())
+        virtual_file.read_range(offset, size).await
     }
 
     #[tracing::instrument(skip(self))]
@@ -113,8 +107,22 @@ mod tests {
         async fn read(&self) -> Result<Pin<Box<dyn futures::AsyncRead + Send>>, JjError> {
             match &**self {
                 MockVirtualFile::File(content) => Ok(Box::pin(Cursor::new(content.clone()))),
-                MockVirtualFile::Directory(_) => Err(JjError::NotAFile),
-                MockVirtualFile::Symlink(_) => Err(JjError::NotAFile),
+                MockVirtualFile::Directory(_) | MockVirtualFile::Symlink(_) => {
+                    Err(JjError::NotAFile)
+                }
+            }
+        }
+
+        async fn read_range(&self, offset: u64, size: u32) -> Result<Box<[u8]>, JjError> {
+            match &**self {
+                MockVirtualFile::File(content) => {
+                    let start = (offset as usize).min(content.len());
+                    let end = start.saturating_add(size as usize).min(content.len());
+                    Ok(content[start..end].to_vec().into_boxed_slice())
+                }
+                MockVirtualFile::Directory(_) | MockVirtualFile::Symlink(_) => {
+                    Err(JjError::NotAFile)
+                }
             }
         }
 
@@ -152,25 +160,16 @@ mod tests {
         }
 
         async fn attributes(&self) -> Result<FileAttributes, JjError> {
+            let now = SystemTime::now();
             match &**self {
-                MockVirtualFile::File(content) => Ok(FileAttributes {
-                    size: content.len() as u64,
-                    file_type: FileType::File,
-                    created: SystemTime::now(),
-                    modified: SystemTime::now(),
-                }),
-                MockVirtualFile::Directory(_) => Ok(FileAttributes {
-                    size: 0,
-                    file_type: FileType::Directory,
-                    created: SystemTime::now(),
-                    modified: SystemTime::now(),
-                }),
-                MockVirtualFile::Symlink(target) => Ok(FileAttributes {
-                    size: target.to_string_lossy().len() as u64,
-                    file_type: FileType::Symlink,
-                    created: SystemTime::now(),
-                    modified: SystemTime::now(),
-                }),
+                MockVirtualFile::File(content) => {
+                    Ok(FileAttributes::file(content.len() as u64, false, now))
+                }
+                MockVirtualFile::Directory(_) => Ok(FileAttributes::directory(now)),
+                MockVirtualFile::Symlink(target) => Ok(FileAttributes::symlink(
+                    target.to_string_lossy().len() as u64,
+                    now,
+                )),
             }
         }
 
@@ -231,10 +230,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_read_root_file() {
+    async fn test_read_root_file_and_middle_range() {
         let fs = setup_test_vfs();
         let content = fs.read(Path::new("file.txt"), 0, 11).await.unwrap();
         assert_eq!(&*content, b"hello world");
+        let middle = fs.read(Path::new("file.txt"), 6, 5).await.unwrap();
+        assert_eq!(&*middle, b"world");
     }
 
     #[tokio::test]
@@ -247,7 +248,6 @@ mod tests {
     #[tokio::test]
     async fn test_list_directory() {
         let fs = setup_test_vfs();
-
         let entries: Vec<_> = fs
             .read_directory(Path::new("dir"))
             .await

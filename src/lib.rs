@@ -34,6 +34,7 @@
 //! remote repository reads and snapshots multiplex over `cc-lib` HTTP/2 gRPC
 //! channels (or `jj-cc-daemon` Unix domain sockets).
 
+pub mod cas;
 pub mod commit_tree_file;
 pub mod commits_directory;
 pub mod fuse;

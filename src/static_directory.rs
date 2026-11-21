@@ -40,12 +40,7 @@ impl VirtualFile for StaticDirectory {
     }
 
     async fn attributes(&self) -> Result<FileAttributes, JjError> {
-        Ok(FileAttributes {
-            size: 0,
-            file_type: FileType::Directory,
-            created: UNIX_EPOCH, // TODO: implement proper timestamps
-            modified: UNIX_EPOCH,
-        })
+        Ok(FileAttributes::directory(UNIX_EPOCH))
     }
 
     async fn file_type(&self) -> Result<FileType, JjError> {

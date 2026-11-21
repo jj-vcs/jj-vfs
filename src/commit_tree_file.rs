@@ -162,9 +162,21 @@ impl VirtualFile for CommitTreeFile {
             }
         };
 
+        let repo_path =
+            RepoPathBuf::from_relative_path(&self.path).map_err(|_| JjError::InvalidPath)?;
+        let merged_val = self.commit.tree().path_value(&repo_path).await?;
+        let mut executable = false;
+        if let Some(Some(TreeValue::File {
+            executable: exec_bit,
+            ..
+        })) = merged_val.as_resolved()
+        {
+            executable = *exec_bit;
+        }
         Ok(FileAttributes {
             size,
             file_type,
+            executable,
             created: UNIX_EPOCH, // TODO: implement proper timestamps
             modified: UNIX_EPOCH,
         })

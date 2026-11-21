@@ -18,25 +18,60 @@ use std::time::SystemTime;
 
 use async_trait::async_trait;
 use futures::AsyncRead;
+use futures::io::AsyncReadExt as _;
 use futures::stream::BoxStream;
 
 use crate::jj_error::JjError;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FileType {
     File,
     Directory,
     Symlink,
 }
 
+#[derive(Clone, Debug)]
 pub struct FileAttributes {
     pub size: u64,
     pub file_type: FileType,
+    pub executable: bool,
     pub created: SystemTime,
     pub modified: SystemTime,
 }
 
-#[derive(Clone)]
+impl FileAttributes {
+    pub fn file(size: u64, executable: bool, modified: SystemTime) -> Self {
+        Self {
+            size,
+            file_type: FileType::File,
+            executable,
+            created: modified,
+            modified,
+        }
+    }
+
+    pub fn directory(modified: SystemTime) -> Self {
+        Self {
+            size: 0,
+            file_type: FileType::Directory,
+            executable: true,
+            created: modified,
+            modified,
+        }
+    }
+
+    pub fn symlink(size: u64, modified: SystemTime) -> Self {
+        Self {
+            size,
+            file_type: FileType::Symlink,
+            executable: false,
+            created: modified,
+            modified,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
 pub struct DirectoryEntry {
     pub name: String,
     pub file_type: FileType,
@@ -44,18 +79,23 @@ pub struct DirectoryEntry {
 
 pub type DirectoryStream = BoxStream<'static, DirectoryEntry>;
 
-/// This trait represents a file in our virtual file system. This can either be
-/// a normal file you can read from or for example a directory, in which case
-/// you can list its contents.
-///
-/// A `VirtualFile` is not meant to be created by the user, but instead returned
-/// by a `PathMapper`. The underlying implementation of `VirtualFile` should
-/// contain all the necessary logic for interacting with the underlying
-/// filesystem (jj-lib in this case) to get the data for a file.
+/// Represents a virtual directory, file, or symlink resolved by a `PathMapper`.
 #[async_trait]
 pub trait VirtualFile: Send + Sync {
     async fn read(&self) -> Result<Pin<Box<dyn AsyncRead + Send>>, JjError> {
         Err(JjError::NotAFile)
+    }
+
+    /// Reads `[offset, offset + size)` directly without discarding prefix bytes
+    /// when backed by ranged gRPC `ReadFile` or local `BlobCas` `pread`.
+    async fn read_range(&self, offset: u64, size: u32) -> Result<Box<[u8]>, JjError> {
+        let reader = self.read().await?;
+        let mut skip_reader = reader.take(offset);
+        futures::io::copy(&mut skip_reader, &mut futures::io::sink()).await?;
+        let inner = skip_reader.into_inner();
+        let mut content = Vec::with_capacity(size as usize);
+        inner.take(size as u64).read_to_end(&mut content).await?;
+        Ok(content.into_boxed_slice())
     }
 
     async fn list(&self) -> Result<DirectoryStream, JjError> {

@@ -32,11 +32,14 @@ async-trait = "0.1.89"
 cc-common = { git = "https://github.com/DanielSperry/jj-commit-cloud.git", rev = "cf8df8b5e76934956049a39aa4504616f3bd58bc" }
 cc-lib = { git = "https://github.com/DanielSperry/jj-commit-cloud.git", rev = "cf8df8b5e76934956049a39aa4504616f3bd58bc" }
 clap = { version = "4.6.1", features = ["derive", "env"] }
+dashmap = "6.2.1"
 fuser = "0.18.0"
 futures = "0.3.33"
+hex = "0.4.3"
 itertools = "0.15.0"
 jj-lib = "0.43.0"
 libc = "0.2.186"
+parking_lot = "0.12.5"
 pollster = "0.4.0"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.151"
@@ -61,11 +64,14 @@ test-helpers = ["dep:tempfile", "dep:pollster"]
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true
+dashmap.workspace = true
 fuser.workspace = true
 futures.workspace = true
+hex.workspace = true
 itertools.workspace = true
 jj-lib.workspace = true
 libc.workspace = true
+parking_lot.workspace = true
 pollster = { workspace = true, optional = true }
 tempfile = { workspace = true, optional = true }
 thiserror.workspace = true

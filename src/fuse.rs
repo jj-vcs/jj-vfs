@@ -217,7 +217,14 @@ impl FileAttributes {
             kind: self.file_type.into(),
             perm: match self.file_type {
                 crate::virtual_file::FileType::Directory => 0o755,
-                _ => 0o644,
+                crate::virtual_file::FileType::Symlink => 0o777,
+                crate::virtual_file::FileType::File => {
+                    if self.executable {
+                        0o755
+                    } else {
+                        0o644
+                    }
+                }
             },
             nlink: match self.file_type {
                 crate::virtual_file::FileType::Directory => 2,

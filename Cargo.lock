@@ -2996,6 +2996,7 @@ dependencies = [
  "dashmap",
  "fuser",
  "futures",
+ "gix 0.85.0",
  "hex",
  "itertools 0.15.0",
  "jj-lib",

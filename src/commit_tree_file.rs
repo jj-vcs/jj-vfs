@@ -59,7 +59,10 @@ impl VirtualFile for CommitTreeFile {
             RepoPathBuf::from_relative_path(&self.path).map_err(|_| JjError::InvalidPath)?;
         let merged_val = self.commit.tree().path_value(&repo_path).await?;
 
-        let resolved_val = merged_val.as_resolved().ok_or(JjError::NotADirectory)?; // TODO: Files with conflicts should also be readable
+        let resolved_val = merged_val.as_resolved().ok_or(JjError::NotADirectory)?; // TODO: Files
+        // with conflicts
+        // should also
+        // be readable
         let file_id = match resolved_val {
             Some(TreeValue::File { id, .. }) => id,
             None => return Err(JjError::NotFound),
@@ -113,7 +116,8 @@ impl VirtualFile for CommitTreeFile {
                     file_type,
                 }
             })
-            .collect(); // TODO: No proper pagination here, since the entire iterator needs to be collected
+            .collect(); // TODO: No proper pagination here, since the entire iterator needs to be
+        // collected
 
         Ok(Box::pin(futures::stream::iter(files)))
     }

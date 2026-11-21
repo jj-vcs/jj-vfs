@@ -39,6 +39,7 @@ gix = { version = "0.85.0", default-features = false, features = ["max-performan
 hex = "0.4.3"
 hyper-util = { version = "0.1.20", features = ["tokio"] }
 itertools = "0.15.0"
+jj-cli = "0.43.0"
 jj-lib = "0.43.0"
 libc = "0.2.186"
 parking_lot = "0.12.5"

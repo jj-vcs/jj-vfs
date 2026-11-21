@@ -53,5 +53,6 @@ pub mod static_directory;
 #[cfg(any(test, feature = "test-helpers"))]
 pub mod test_helpers;
 pub mod vfs;
+pub mod vfs_working_copy;
 pub mod virtual_file;
 pub mod workspaces_directory;

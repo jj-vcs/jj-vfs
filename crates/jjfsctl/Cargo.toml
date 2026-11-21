@@ -22,11 +22,17 @@ license.workspace = true
 name = "jj-vfs"
 path = "src/main.rs"
 
+[[bin]]
+name = "jj"
+path = "src/jj_main.rs"
+
 [dependencies]
 anyhow.workspace = true
 cc-common.workspace = true
 cc-lib.workspace = true
 clap.workspace = true
+jj-cli.workspace = true
+jj-lib.workspace = true
 jjfsd = { path = "../.." }
 serde_json.workspace = true
 tokio.workspace = true

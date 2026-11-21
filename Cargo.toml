@@ -63,7 +63,7 @@ license.workspace = true
 
 [features]
 default = []
-test-helpers = ["dep:tempfile", "dep:pollster"]
+test-helpers = ["dep:tempfile"]
 
 [dependencies]
 anyhow.workspace = true
@@ -81,12 +81,13 @@ itertools.workspace = true
 jj-lib.workspace = true
 libc.workspace = true
 parking_lot.workspace = true
-pollster = { workspace = true, optional = true }
+pollster.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tempfile = { workspace = true, optional = true }
 thiserror.workspace = true
 tokio.workspace = true
+toml.workspace = true
 tonic.workspace = true
 tower.workspace = true
 tracing.workspace = true

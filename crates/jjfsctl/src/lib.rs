@@ -376,6 +376,7 @@ pub async fn execute_vfs_command(args: &VfsCommandArgs) -> anyhow::Result<()> {
                         user: user.unwrap_or_default(),
                         workspace,
                     },
+                    publish_op: true,
                 },
             )
             .await?;

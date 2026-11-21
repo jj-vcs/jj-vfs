@@ -48,6 +48,7 @@ pub mod overlay;
 pub mod path_mapper;
 pub mod path_mapper_all_commits;
 pub mod registry;
+pub mod snapshot;
 pub mod static_directory;
 #[cfg(any(test, feature = "test-helpers"))]
 pub mod test_helpers;

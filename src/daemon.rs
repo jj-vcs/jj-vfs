@@ -26,12 +26,16 @@ use async_trait::async_trait;
 use parking_lot::Mutex;
 use tokio::sync::Notify;
 use vfs_proto::ActiveMountInfo;
+use vfs_proto::CheckoutTreeResult;
 use vfs_proto::ControlRequest;
 use vfs_proto::ControlResponse;
 use vfs_proto::DEFAULT_MAX_CACHE_BYTES;
 use vfs_proto::DaemonStatus;
 use vfs_proto::InstancePaths;
 use vfs_proto::MountScope;
+use vfs_proto::SnapshotResult;
+use vfs_proto::WorkspaceKey;
+use vfs_proto::encode_repo_segment;
 
 use crate::cas::BlobCas;
 use crate::fuse::JjFuse;
@@ -44,6 +48,9 @@ use crate::namespace::SubtreePathMapper;
 use crate::overlay::OverlayManager;
 use crate::registry::SourceRegistry;
 use crate::registry::expand_tilde;
+use crate::snapshot::snapshot_workspace_cc;
+use crate::snapshot::snapshot_workspace_local;
+use crate::snapshot::sync_synthesized_vfs_state_file;
 
 struct ActiveMountEntry {
     info: ActiveMountInfo,
@@ -70,6 +77,21 @@ pub struct DaemonRuntime {
     router: Arc<NamespaceRouter>,
     mounts: Mutex<BTreeMap<PathBuf, ActiveMountEntry>>,
     mounting: Mutex<BTreeSet<PathBuf>>,
+    workspace_locks: dashmap::DashMap<WorkspaceKey, Arc<tokio::sync::Mutex<()>>>,
+    pending_cli_snapshots: dashmap::DashMap<WorkspaceKey, std::time::Instant>,
+    skipped_bg_snapshots: dashmap::DashMap<WorkspaceKey, (String, u64)>,
+}
+
+#[derive(Clone, Debug)]
+pub struct CheckoutTreeOptions {
+    pub old_tree_id_hex: Option<String>,
+    pub new_tree_id_hex: String,
+    pub new_tree_ids_hex: Vec<String>,
+    pub conflict_labels: Vec<String>,
+    pub new_commit_id_hex: Option<String>,
+    pub new_operation_id_hex: Option<String>,
+    pub captured_seq: Option<u64>,
+    pub publish_ws_state: bool,
 }
 
 impl DaemonRuntime {
@@ -88,6 +110,9 @@ impl DaemonRuntime {
             router,
             mounts: Mutex::new(BTreeMap::new()),
             mounting: Mutex::new(BTreeSet::new()),
+            workspace_locks: dashmap::DashMap::new(),
+            pending_cli_snapshots: dashmap::DashMap::new(),
+            skipped_bg_snapshots: dashmap::DashMap::new(),
         }))
     }
 
@@ -224,8 +249,345 @@ impl DaemonRuntime {
         Ok(info)
     }
 
-    /// Detaches a single active FUSE mountpoint.
+    fn normalize_workspace_key(&self, mut key: WorkspaceKey) -> Result<WorkspaceKey, JjError> {
+        if key.user.is_empty() {
+            key.user = self
+                .registry
+                .default_user_for_source(&key.source)
+                .ok_or(JjError::NotFound)?;
+        }
+        Ok(key)
+    }
+
+    fn workspace_lock(&self, key: &WorkspaceKey) -> Arc<tokio::sync::Mutex<()>> {
+        self.workspace_locks
+            .entry(key.clone())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    }
+
+    /// Spawns the debounced ($2\text{ s}$ default) background snapshot worker
+    /// task.
+    pub fn start_background_tasks(self: &Arc<Self>, shutdown: Arc<Notify>) {
+        let rt = Arc::clone(self);
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_millis(250));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    _ = shutdown.notified() => break,
+                    _ = ticker.tick() => {
+                        let debounce = std::time::Duration::from_millis(
+                            rt.registry.snapshot_debounce_ms().max(50),
+                        );
+                        for ovl in rt.overlays.active_overlays() {
+                            let Some((dirty_seq, Some(last_mut))) = ovl.dirty_status() else {
+                                continue;
+                            };
+                            if last_mut.elapsed() < debounce {
+                                continue;
+                            }
+                            let Ok(norm_key) = rt.normalize_workspace_key(ovl.key().clone()) else {
+                                continue;
+                            };
+                            if rt
+                                .pending_cli_snapshots
+                                .get(&norm_key)
+                                .is_some_and(|t0| {
+                                    t0.elapsed() < std::time::Duration::from_secs(15)
+                                })
+                            {
+                                continue;
+                            }
+                            if let Some(cached) = rt.router.cached_workspace_head(&norm_key) {
+                                if rt
+                                    .skipped_bg_snapshots
+                                    .get(&norm_key)
+                                    .is_some_and(|s| {
+                                        s.0 == cached.commit_id_hex && s.1 == dirty_seq
+                                    })
+                                {
+                                    continue;
+                                }
+                                if cached.tree_ids_hex.len() > 1 {
+                                    tracing::warn!(
+                                        workspace = ?norm_key,
+                                        "skipping background auto-snapshot on conflicted working-copy commit"
+                                    );
+                                    rt.skipped_bg_snapshots
+                                        .insert(norm_key, (cached.commit_id_hex, dirty_seq));
+                                    continue;
+                                }
+                            }
+                            match rt.snapshot_workspace(norm_key.clone(), true).await {
+                                Ok(_) => {
+                                    rt.skipped_bg_snapshots.remove(&norm_key);
+                                }
+                                Err(err) => {
+                                    tracing::warn!(
+                                        workspace = ?norm_key,
+                                        error = %err,
+                                        "background debounced snapshot skipped or failed"
+                                    );
+                                    if let Some(head) = rt.router.cached_workspace_head(&norm_key) {
+                                        rt.skipped_bg_snapshots
+                                            .insert(norm_key, (head.commit_id_hex, dirty_seq));
+                                    }
+                                }
+                            }
+                        }
+
+                    }
+                }
+            }
+        });
+    }
+    /// Executes an $O(k)$ dirty-path snapshot on `key`.
+    pub async fn snapshot_workspace(
+        &self,
+        key: WorkspaceKey,
+        publish_op: bool,
+    ) -> Result<SnapshotResult, JjError> {
+        let key = self.normalize_workspace_key(key)?;
+        let ws_mutex = self.workspace_lock(&key);
+        let _ws_guard = ws_mutex.lock().await;
+
+        let ws_ref = self.router.resolve_workspace_ref(&key).await?;
+        let overlay = self.overlays.get_or_open(&key)?;
+        let repo_seg = encode_repo_segment(&key.repo);
+
+        if let Some(cc) = self.registry.resolve_cc_repo(&key.source, &repo_seg)? {
+            let paths = self.registry.paths();
+            let (res, updated_ref) = snapshot_workspace_cc(
+                &paths.state_dir,
+                &paths.socket_path,
+                &key,
+                &overlay,
+                &cc,
+                ws_ref,
+                publish_op,
+            )
+            .await?;
+            if publish_op {
+                self.pending_cli_snapshots.remove(&key);
+                self.skipped_bg_snapshots.remove(&key);
+                self.router.set_workspace_head(key.clone(), updated_ref);
+            } else if res.captured_seq.is_some() {
+                self.pending_cli_snapshots
+                    .insert(key.clone(), std::time::Instant::now());
+            }
+            return Ok(res);
+        }
+
+        if let Some(local_jj) = ws_ref.local_jj_dir.clone() {
+            let (res, updated_ref) =
+                snapshot_workspace_local(&key, &overlay, &local_jj, ws_ref, publish_op).await?;
+            if publish_op {
+                self.pending_cli_snapshots.remove(&key);
+                self.skipped_bg_snapshots.remove(&key);
+                self.router.set_workspace_head(key.clone(), updated_ref);
+            } else if res.captured_seq.is_some() {
+                self.pending_cli_snapshots
+                    .insert(key.clone(), std::time::Instant::now());
+            }
+            return Ok(res);
+        }
+
+        Err(JjError::ReadOnly)
+    }
+
+    /// Updates workspace base tree/commit/operation pointers on `CheckoutTree`,
+    /// diffs `old_tree` vs `new_tree` skipping identical subtrees ($0$ blob
+    /// reads), and sends targeted `fuser::Notifier` invalidations across all
+    /// covering mounts.
+    pub async fn checkout_tree(
+        &self,
+        key: WorkspaceKey,
+        old_tree_id_hex: Option<String>,
+        new_tree_id_hex: String,
+        new_commit_id_hex: Option<String>,
+        new_operation_id_hex: Option<String>,
+    ) -> Result<CheckoutTreeResult, JjError> {
+        self.checkout_tree_with_options(
+            key,
+            CheckoutTreeOptions {
+                old_tree_id_hex,
+                new_tree_id_hex,
+                new_tree_ids_hex: Vec::new(),
+                conflict_labels: Vec::new(),
+                new_commit_id_hex,
+                new_operation_id_hex,
+                captured_seq: None,
+                publish_ws_state: true,
+            },
+        )
+        .await
+    }
+
+    pub async fn checkout_tree_with_options(
+        &self,
+        key: WorkspaceKey,
+        opts: CheckoutTreeOptions,
+    ) -> Result<CheckoutTreeResult, JjError> {
+        let key = self.normalize_workspace_key(key)?;
+        let ws_mutex = self.workspace_lock(&key);
+        let _ws_guard = ws_mutex.lock().await;
+        self.checkout_tree_locked(key, opts).await
+    }
+
+    async fn checkout_tree_locked(
+        &self,
+        key: WorkspaceKey,
+        opts: CheckoutTreeOptions,
+    ) -> Result<CheckoutTreeResult, JjError> {
+        let mut ws_ref = self.router.resolve_workspace_ref(&key).await?;
+        let repo_seg = encode_repo_segment(&key.repo);
+        let cc_opt = self.registry.resolve_cc_repo(&key.source, &repo_seg)?;
+
+        if let Some(ref new_op) = opts.new_operation_id_hex
+            && !new_op.is_empty()
+            && !ws_ref.operation_id_hex.is_empty()
+            && new_op != &ws_ref.operation_id_hex
+            && is_strict_op_ancestor(
+                cc_opt.as_ref(),
+                ws_ref.local_jj_dir.as_deref(),
+                new_op,
+                &ws_ref.operation_id_hex,
+            )
+            .await
+        {
+            return Err(std::io::Error::other(format!(
+                "refusing to revert workspace head from operation {} to older ancestor operation \
+                 {}",
+                ws_ref.operation_id_hex, new_op
+            ))
+            .into());
+        }
+
+        let resolved_commit_id_hex = if let Some(cid) = opts.new_commit_id_hex {
+            cid
+        } else if let Some(ref new_op) = opts.new_operation_id_hex
+            && !new_op.is_empty()
+            && new_op != &ws_ref.operation_id_hex
+        {
+            if let Some(ref cc) = cc_opt {
+                cc.resolve_wc_commit_at_op(new_op, &key.workspace)
+                    .await?
+                    .ok_or_else(|| {
+                        std::io::Error::other(format!(
+                            "workspace '{}' missing from Commit Cloud view at operation {}",
+                            key.workspace, new_op
+                        ))
+                    })?
+            } else if let Some(ref local_jj) = ws_ref.local_jj_dir {
+                resolve_local_wc_commit_at_op(local_jj, new_op, &key.workspace)
+                    .await?
+                    .ok_or_else(|| {
+                        std::io::Error::other(format!(
+                            "workspace '{}' missing from local view at operation {}",
+                            key.workspace, new_op
+                        ))
+                    })?
+            } else {
+                ws_ref.commit_id_hex.clone()
+            }
+        } else {
+            ws_ref.commit_id_hex.clone()
+        };
+
+        let mut completed_dirty_paths = Vec::new();
+        if let Some(seq) = opts.captured_seq {
+            let overlay = self.overlays.get_or_open(&key)?;
+            completed_dirty_paths = overlay.capture_dirty_snapshot().1.into_keys().collect();
+            let _ = overlay.complete_snapshot(seq)?;
+        }
+        self.pending_cli_snapshots.remove(&key);
+        self.skipped_bg_snapshots.remove(&key);
+
+        let served_old_tree = ws_ref.tree_id_hex.clone();
+        let served_old_tree_ids = if ws_ref.tree_ids_hex.is_empty() {
+            vec![served_old_tree.clone()]
+        } else {
+            ws_ref.tree_ids_hex.clone()
+        };
+        let effective_new_tree_ids = if opts.new_tree_ids_hex.is_empty() {
+            vec![opts.new_tree_id_hex.clone()]
+        } else {
+            opts.new_tree_ids_hex
+        };
+
+        ws_ref.tree_id_hex = opts.new_tree_id_hex.clone();
+        ws_ref.tree_ids_hex = effective_new_tree_ids.clone();
+        ws_ref.conflict_labels = opts.conflict_labels;
+        ws_ref.commit_id_hex = resolved_commit_id_hex.clone();
+        if let Some(op_id) = opts.new_operation_id_hex {
+            ws_ref.operation_id_hex = op_id;
+        }
+
+        let paths = self.registry.paths();
+        sync_synthesized_vfs_state_file(&paths.state_dir, &paths.socket_path, &key, &ws_ref);
+        self.router.set_workspace_head(key.clone(), ws_ref.clone());
+
+        if opts.publish_ws_state
+            && let Some(ref cc) = cc_opt
+            && let (Ok(cid_b), Ok(op_b), Ok(tid_b)) = (
+                hex::decode(&ws_ref.commit_id_hex),
+                hex::decode(&ws_ref.operation_id_hex),
+                hex::decode(&ws_ref.tree_id_hex),
+            )
+        {
+            let all_tids: Vec<Vec<u8>> = ws_ref
+                .tree_ids_hex
+                .iter()
+                .filter_map(|h| hex::decode(h).ok())
+                .collect();
+            if let Err(err) = cc
+                .update_workspace_state(cc_common::workspace::WorkspaceState {
+                    repo_id: cc.repo_id().to_string(),
+                    user: key.user.clone(),
+                    workspace_name: key.workspace.clone(),
+                    commit_id: cid_b,
+                    operation_id: op_b,
+                    tree_id: tid_b,
+                    sparse_patterns: Vec::new(),
+                    tree_ids: all_tids,
+                })
+                .await
+            {
+                tracing::warn!(
+                    workspace = ?key,
+                    error = %err,
+                    "failed to publish WorkspaceState during checkout_tree"
+                );
+            }
+        }
+
+        let _ = (
+            &opts.old_tree_id_hex,
+            &served_old_tree_ids,
+            &completed_dirty_paths,
+        );
+        Ok(CheckoutTreeResult {
+            workspace: key,
+            old_tree_id_hex: served_old_tree,
+            new_tree_id_hex: opts.new_tree_id_hex,
+            invalidated_paths: Vec::new(),
+            commit_id_hex: Some(resolved_commit_id_hex),
+        })
+    }
+
+    async fn flush_all_dirty_overlays(&self) {
+        for ovl in self.overlays.active_overlays() {
+            if ovl.has_dirty_tracked_paths() {
+                let _ = self.snapshot_workspace(ovl.key().clone(), true).await;
+            }
+        }
+    }
+
+    /// Detaches a single active FUSE mountpoint after flushing pending
+    /// snapshots.
     pub async fn unmount_target(&self, mountpoint: &Path) -> Result<PathBuf, JjError> {
+        self.flush_all_dirty_overlays().await;
         let canon_mp =
             std::fs::canonicalize(mountpoint).unwrap_or_else(|_| mountpoint.to_path_buf());
         let removed = self
@@ -240,8 +602,9 @@ impl DaemonRuntime {
         Ok(canon_mp)
     }
 
-    /// Cleanly detaches all active FUSE sessions before daemon shutdown.
+    /// Cleanly flushes dirty snapshots and detaches all active FUSE sessions.
     pub async fn unmount_all(&self) {
+        self.flush_all_dirty_overlays().await;
         let entries: Vec<ActiveMountEntry> = {
             let mut guard = self.mounts.lock();
             std::mem::take(&mut *guard).into_values().collect()
@@ -342,12 +705,41 @@ impl ControlHandler for DaemonRuntime {
                     Err(e) => error_to_response(e),
                 }
             }
-            ControlRequest::SnapshotWorkspace { .. } | ControlRequest::CheckoutTree { .. } => {
-                ControlResponse::Error {
-                    code: "unimplemented".to_string(),
-                    message: "snapshot/checkout handlers attach in commits 8-9".to_string(),
-                }
-            }
+            ControlRequest::SnapshotWorkspace {
+                workspace,
+                publish_op,
+            } => match self.snapshot_workspace(workspace, publish_op).await {
+                Ok(res) => ControlResponse::Snapshotted(res),
+                Err(e) => error_to_response(e),
+            },
+            ControlRequest::CheckoutTree {
+                workspace,
+                old_tree_id_hex,
+                new_tree_id_hex,
+                new_tree_ids_hex,
+                conflict_labels,
+                new_commit_id_hex,
+                new_operation_id_hex,
+                captured_seq,
+            } => match self
+                .checkout_tree_with_options(
+                    workspace,
+                    CheckoutTreeOptions {
+                        old_tree_id_hex,
+                        new_tree_id_hex,
+                        new_tree_ids_hex,
+                        conflict_labels,
+                        new_commit_id_hex,
+                        new_operation_id_hex,
+                        captured_seq,
+                        publish_ws_state: true,
+                    },
+                )
+                .await
+            {
+                Ok(res) => ControlResponse::CheckedOut(res),
+                Err(e) => error_to_response(e),
+            },
         }
     }
 }
@@ -396,6 +788,178 @@ fn detach_stale_fuse_mount(path: &Path) {
     }
 }
 
+async fn is_strict_op_ancestor(
+    cc_opt: Option<&Arc<crate::backend::commit_cloud::CommitCloudVfsBackend>>,
+    local_jj_dir: Option<&Path>,
+    candidate_older_hex: &str,
+    current_hex: &str,
+) -> bool {
+    if candidate_older_hex == current_hex {
+        return false;
+    }
+    if let Some(cc) = cc_opt {
+        let mut queue = std::collections::VecDeque::new();
+        let mut visited = std::collections::HashSet::new();
+        queue.push_back(current_hex.to_string());
+        visited.insert(current_hex.to_string());
+        while let Some(curr) = queue.pop_front() {
+            if visited.len() > 64 {
+                break;
+            }
+            let Ok(op) = cc.read_operation_proto(&curr).await else {
+                break;
+            };
+            for p_bytes in op.parents {
+                let p_hex = hex::encode(p_bytes);
+                if p_hex == candidate_older_hex {
+                    return true;
+                }
+                if visited.insert(p_hex.clone()) {
+                    queue.push_back(p_hex);
+                }
+            }
+        }
+        return false;
+    }
+    if let Some(jj_dir) = local_jj_dir {
+        let jj_owned = jj_dir.to_path_buf();
+        let cand_owned = candidate_older_hex.to_string();
+        let curr_owned = current_hex.to_string();
+        return tokio::task::spawn_blocking(move || {
+            futures::executor::block_on(is_local_op_strict_ancestor(
+                &jj_owned,
+                &cand_owned,
+                &curr_owned,
+            ))
+        })
+        .await
+        .unwrap_or(false);
+    }
+    false
+}
+
+async fn is_local_op_strict_ancestor(
+    local_jj_dir: &Path,
+    candidate_older_hex: &str,
+    current_hex: &str,
+) -> bool {
+    use jj_lib::config::ConfigLayer;
+    use jj_lib::config::ConfigSource;
+    use jj_lib::config::StackedConfig;
+    use jj_lib::object_id::ObjectId as _;
+    use jj_lib::op_store::OperationId;
+    use jj_lib::repo::StoreFactories;
+    use jj_lib::settings::UserSettings;
+    use jj_lib::workspace::Workspace;
+    use jj_lib::workspace::default_working_copy_factories;
+
+    let Some(ws_root) = local_jj_dir.parent() else {
+        return false;
+    };
+    let mut config = StackedConfig::with_defaults();
+    if let Ok(layer) = ConfigLayer::parse(
+        ConfigSource::User,
+        "user.name = \"jj-vfs\"\nuser.email = \"jj-vfs@localhost\"\n",
+    ) {
+        config.add_layer(layer);
+    }
+    let Ok(settings) = UserSettings::from_config(config) else {
+        return false;
+    };
+    let Ok(ws) = Workspace::load(
+        &settings,
+        ws_root,
+        &StoreFactories::default(),
+        &default_working_copy_factories(),
+    ) else {
+        return false;
+    };
+    let op_store = ws.repo_loader().op_store();
+    let Some(start_id) = OperationId::try_from_hex(current_hex) else {
+        return false;
+    };
+    let mut queue = std::collections::VecDeque::new();
+    let mut visited = std::collections::HashSet::new();
+    queue.push_back(start_id.clone());
+    visited.insert(start_id);
+    while let Some(curr) = queue.pop_front() {
+        if visited.len() > 64 {
+            break;
+        }
+        let Ok(op_data) = op_store.read_operation(&curr).await else {
+            break;
+        };
+        for parent_id in op_data.parents {
+            if parent_id.hex() == candidate_older_hex {
+                return true;
+            }
+            if visited.insert(parent_id.clone()) {
+                queue.push_back(parent_id);
+            }
+        }
+    }
+    false
+}
+
+async fn resolve_local_wc_commit_at_op(
+    local_jj_dir: &Path,
+    op_id_hex: &str,
+    ws_name: &str,
+) -> Result<Option<String>, JjError> {
+    let jj_owned = jj_dir_to_buf(local_jj_dir);
+    let op_owned = op_id_hex.to_string();
+    let ws_owned = ws_name.to_string();
+    tokio::task::spawn_blocking(move || {
+        futures::executor::block_on(async move {
+            use jj_lib::config::ConfigLayer;
+            use jj_lib::config::ConfigSource;
+            use jj_lib::config::StackedConfig;
+            use jj_lib::object_id::ObjectId as _;
+            use jj_lib::op_store::OperationId;
+            use jj_lib::ref_name::WorkspaceNameBuf;
+            use jj_lib::repo::StoreFactories;
+            use jj_lib::settings::UserSettings;
+            use jj_lib::workspace::Workspace;
+            use jj_lib::workspace::default_working_copy_factories;
+
+            let ws_root = jj_owned.parent().ok_or(JjError::InvalidPath)?;
+            let mut config = StackedConfig::with_defaults();
+            let layer = ConfigLayer::parse(
+                ConfigSource::User,
+                "user.name = \"jj-vfs\"\nuser.email = \"jj-vfs@localhost\"\n",
+            )
+            .map_err(|e| std::io::Error::other(format!("config parse error: {e}")))?;
+            config.add_layer(layer);
+            let settings = UserSettings::from_config(config)
+                .map_err(|e| std::io::Error::other(format!("settings error: {e}")))?;
+            let ws = Workspace::load(
+                &settings,
+                ws_root,
+                &StoreFactories::default(),
+                &default_working_copy_factories(),
+            )
+            .map_err(|e| std::io::Error::other(format!("load local workspace failed: {e:?}")))?;
+            let op_id = OperationId::try_from_hex(&op_owned).ok_or(JjError::InvalidPath)?;
+            let op_store = ws.repo_loader().op_store();
+            let op_data = op_store
+                .read_operation(&op_id)
+                .await
+                .map_err(|e| std::io::Error::other(format!("read_operation failed: {e:?}")))?;
+            let view = op_store
+                .read_view(&op_data.view_id)
+                .await
+                .map_err(|e| std::io::Error::other(format!("read_view failed: {e:?}")))?;
+            let ws_key = WorkspaceNameBuf::from(ws_owned);
+            Ok(view.wc_commit_ids.get(&ws_key).map(|cid| cid.hex()))
+        })
+    })
+    .await
+    .map_err(|e| std::io::Error::other(format!("resolve_local_wc_commit task panicked: {e}")))?
+}
+
+fn jj_dir_to_buf(p: &Path) -> PathBuf {
+    p.to_path_buf()
+}
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -912,5 +1476,238 @@ mod tests {
         assert_eq!(jj_ro_err.raw_os_error(), Some(libc::EROFS));
 
         runtime.unmount_all().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn debounced_background_snapshot_commits_dirty_files_without_tree_walk() {
+        if !fuse_available() {
+            eprintln!("skipping FUSE test: /dev/fuse unavailable");
+            return;
+        }
+        let (ws_a, _repo_a, initial_cid) = setup_test_repo().await;
+
+        let state_dir = tempfile::tempdir().unwrap();
+        let paths = InstancePaths::resolve(Some("debounce-test"), Some(state_dir.path()));
+        paths.ensure_dirs().unwrap();
+        let mut cfg = vfs_proto::VfsConfigFile::default();
+        cfg.daemon.snapshot_debounce_ms = 80;
+        cfg.save_atomic(&paths.config_path).unwrap();
+
+        let runtime = DaemonRuntime::new(paths).unwrap();
+        let shutdown = Arc::new(Notify::new());
+        runtime.start_background_tasks(Arc::clone(&shutdown));
+
+        let repo_name = ws_a
+            .path()
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        runtime
+            .registry()
+            .add_source(
+                "local".into(),
+                SourceConfig {
+                    kind: SourceKind::LocalJj,
+                    url: None,
+                    daemon_socket: None,
+                    user: None,
+                    auth_token_env: None,
+                    auth_token_cmd: vec![],
+                    path: Some(ws_a.path().to_path_buf()),
+                    search_paths: vec![],
+                    repos: BTreeMap::new(),
+                    ephemeral: true,
+                },
+            )
+            .unwrap();
+
+        let mnt = tempfile::tempdir().unwrap();
+        runtime
+            .mount_target(
+                Some(format!("local:{repo_name}/default")),
+                mnt.path().to_path_buf(),
+                false,
+            )
+            .await
+            .unwrap();
+
+        for _ in 0..30 {
+            if mnt.path().join("file1.txt").exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        }
+
+        std::fs::write(mnt.path().join(".gitignore"), "target/\n").unwrap();
+        std::fs::create_dir(mnt.path().join("target")).unwrap();
+        std::fs::write(mnt.path().join("target/tmp.o"), b"NO_UPLOAD").unwrap();
+        std::fs::write(mnt.path().join("file1.txt"), "snapshotted automatically").unwrap();
+
+        // Wait for the 80ms debounce + 250ms background ticker to publish the
+        // snapshot
+        let ws_key = WorkspaceKey {
+            source: "local".into(),
+            repo: repo_name.clone(),
+            user: "local".into(),
+            workspace: "default".into(),
+        };
+        let mut snapshotted_cid = initial_cid.hex();
+        for _ in 0..30 {
+            let head = runtime
+                .router()
+                .resolve_workspace_ref(&ws_key)
+                .await
+                .unwrap();
+            if head.commit_id_hex != initial_cid.hex() {
+                snapshotted_cid = head.commit_id_hex;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        }
+        assert_ne!(
+            snapshotted_cid,
+            initial_cid.hex(),
+            "background debounce should commit new wc"
+        );
+
+        // Verify the committed tree has `file1.txt` == "snapshotted
+        // automatically" and NO `target/tmp.o`!
+        let backend = runtime
+            .registry()
+            .resolve_repo("local", &repo_name)
+            .unwrap();
+        let data = backend
+            .read_file_range(&snapshotted_cid, Path::new("file1.txt"), 0, 64)
+            .await
+            .unwrap();
+        assert_eq!(&*data, b"snapshotted automatically");
+        assert!(matches!(
+            backend
+                .lookup_in_commit(&snapshotted_cid, Path::new("target/tmp.o"))
+                .await,
+            Err(JjError::NotFound)
+        ));
+
+        shutdown.notify_waiters();
+        runtime.unmount_all().await;
+    }
+
+    #[tokio::test]
+    async fn checkout_tree_rejects_older_ancestor_op_and_updates_head_before_diff() {
+        use jj_lib::repo::Repo as _;
+
+        let (ws_a, repo_a, cid_v1) = setup_test_repo().await;
+        let op_v1_hex = repo_a.op_id().hex();
+        let c1 = repo_a.store().get_commit(&cid_v1).unwrap();
+        let tid_v1_hex = c1.tree_ids().as_resolved().unwrap().hex();
+
+        let mut tx = repo_a.start_transaction();
+        let c2 = tx
+            .repo_mut()
+            .new_commit(vec![cid_v1.clone()], c1.tree())
+            .set_description("child op commit")
+            .write()
+            .await
+            .unwrap();
+        tx.repo_mut()
+            .set_wc_commit(
+                jj_lib::ref_name::WorkspaceNameBuf::from("default"),
+                c2.id().clone(),
+            )
+            .unwrap();
+        let repo_v2 = tx.commit("advance to v2").await.unwrap();
+        let op_v2_hex = repo_v2.op_id().hex();
+
+        let state_dir = tempfile::tempdir().unwrap();
+        let paths = InstancePaths::resolve(Some("op-guard-test"), Some(state_dir.path()));
+        let runtime = DaemonRuntime::new(paths).unwrap();
+        let repo_name = ws_a
+            .path()
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        runtime
+            .registry()
+            .add_source(
+                "local".into(),
+                SourceConfig {
+                    kind: SourceKind::LocalJj,
+                    url: None,
+                    daemon_socket: None,
+                    user: None,
+                    auth_token_env: None,
+                    auth_token_cmd: vec![],
+                    path: Some(ws_a.path().to_path_buf()),
+                    search_paths: vec![],
+                    repos: BTreeMap::new(),
+                    ephemeral: true,
+                },
+            )
+            .unwrap();
+
+        let ws_key = WorkspaceKey {
+            source: "local".into(),
+            repo: repo_name,
+            user: "local".into(),
+            workspace: "default".into(),
+        };
+        let initial_ref = runtime
+            .router()
+            .resolve_workspace_ref(&ws_key)
+            .await
+            .unwrap();
+        assert_eq!(initial_ref.operation_id_hex, op_v2_hex);
+
+        // Attempting to revert from `op_v2` back to strict ancestor `op_v1`
+        // must fail!
+        let revert_err = runtime
+            .checkout_tree(
+                ws_key.clone(),
+                Some(tid_v1_hex.clone()),
+                tid_v1_hex.clone(),
+                Some(cid_v1.hex()),
+                Some(op_v1_hex),
+            )
+            .await
+            .unwrap_err();
+        assert!(revert_err.to_string().contains("refusing to revert"));
+        assert_eq!(
+            runtime
+                .router()
+                .resolve_workspace_ref(&ws_key)
+                .await
+                .unwrap()
+                .commit_id_hex,
+            c2.id().hex()
+        );
+
+        // Even if `old_tree_id_hex` is missing from store (causing best-effort
+        // `diff_trees` to error), `checkout_tree` updates the workspace head
+        // first and succeeds!
+        let missing_old_tree = "ff".repeat(20);
+        let co_ok = runtime
+            .checkout_tree(
+                ws_key.clone(),
+                Some(missing_old_tree),
+                tid_v1_hex,
+                Some(cid_v1.hex()),
+                Some(op_v2_hex),
+            )
+            .await
+            .unwrap();
+        assert_eq!(co_ok.commit_id_hex.as_deref(), Some(cid_v1.hex().as_str()));
+        assert_eq!(
+            runtime
+                .router()
+                .resolve_workspace_ref(&ws_key)
+                .await
+                .unwrap()
+                .commit_id_hex,
+            cid_v1.hex()
+        );
     }
 }

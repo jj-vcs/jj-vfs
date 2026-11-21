@@ -418,6 +418,67 @@ pub struct CheckoutTreeResult {
     pub commit_id_hex: Option<String>,
 }
 
+/// Persisted working-copy state inside `<jj_dir>/working_copy/vfs_state.json`
+/// for `VfsWorkingCopy` (`working_copy` type `"vfs"`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VfsWorkingCopyStateFile {
+    pub socket_path: PathBuf,
+    pub workspace: WorkspaceKey,
+    pub operation_id_hex: String,
+    pub tree_ids_hex: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conflict_labels: Vec<String>,
+    pub commit_id_hex: String,
+    #[serde(default)]
+    pub sparse_patterns: Vec<String>,
+}
+
+static VFS_STATE_TMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+impl VfsWorkingCopyStateFile {
+    pub const FILENAME: &'static str = "vfs_state.json";
+
+    pub fn load(state_dir: &Path) -> Result<Self, ProtoError> {
+        let raw = std::fs::read_to_string(state_dir.join(Self::FILENAME))?;
+        Ok(serde_json::from_str(&raw)?)
+    }
+
+    pub fn save_atomic(&self, state_dir: &Path) -> Result<(), ProtoError> {
+        use std::io::Write as _;
+
+        std::fs::create_dir_all(state_dir)?;
+        let dst = state_dir.join(Self::FILENAME);
+        let seq = VFS_STATE_TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp = state_dir.join(format!(".vfs_state.json.tmp.{}.{seq}", std::process::id()));
+        let raw = serde_json::to_vec_pretty(self)?;
+        let write_res = (|| -> std::io::Result<()> {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp)?;
+            file.write_all(&raw)?;
+            file.sync_all()?;
+            Ok(())
+        })();
+        if let Err(err) = write_res {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(err.into());
+        }
+        if let Err(err) = std::fs::rename(&tmp, &dst) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(err.into());
+        }
+        if let Ok(dir_file) = std::fs::File::open(state_dir) {
+            let _ = dir_file.sync_all();
+        }
+        Ok(())
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum ControlRequest {
@@ -443,6 +504,8 @@ pub enum ControlRequest {
     },
     SnapshotWorkspace {
         workspace: WorkspaceKey,
+        #[serde(default = "default_true")]
+        publish_op: bool,
     },
     CheckoutTree {
         workspace: WorkspaceKey,
@@ -829,5 +892,63 @@ mod tests {
             overridden.config_path,
             PathBuf::from("/explicit/state/config.toml")
         );
+    }
+
+    #[test]
+    fn vfs_state_save_atomic_is_concurrent_safe_and_backward_compatible() {
+        let dir = std::env::temp_dir().join(format!(
+            "jj-vfs-state-atomic-{}-{}",
+            std::process::id(),
+            VFS_STATE_TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut handles = Vec::new();
+        for idx in 0..8 {
+            let d = dir.clone();
+            handles.push(std::thread::spawn(move || {
+                for round in 0..16 {
+                    let state = VfsWorkingCopyStateFile {
+                        socket_path: PathBuf::from("/tmp/control.sock"),
+                        workspace: WorkspaceKey {
+                            source: "corp".into(),
+                            repo: "webapp".into(),
+                            user: "alice".into(),
+                            workspace: "default".into(),
+                        },
+                        operation_id_hex: format!("{idx:02x}{round:02x}{}", "a".repeat(36)),
+                        tree_ids_hex: vec!["11".repeat(20), "22".repeat(20), "33".repeat(20)],
+                        conflict_labels: vec!["side 1".into(), "base".into(), "side 2".into()],
+                        commit_id_hex: "cc".repeat(20),
+                        sparse_patterns: vec![String::new()],
+                    };
+                    state.save_atomic(&d).unwrap();
+                    let loaded = VfsWorkingCopyStateFile::load(&d).unwrap();
+                    assert_eq!(loaded.tree_ids_hex.len(), 3);
+                    assert_eq!(loaded.conflict_labels.len(), 3);
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // Verify legacy JSON payloads without optional fields still deserialize
+        // cleanly
+        let legacy_co: ControlRequest = serde_json::from_str(
+            r#"{"op":"checkout_tree","workspace":{"source":"c","repo":"r","user":"u","workspace":"w"},"old_tree_id_hex":null,"new_tree_id_hex":"abcd","new_commit_id_hex":null,"new_operation_id_hex":null}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            legacy_co,
+            ControlRequest::CheckoutTree {
+                captured_seq: None,
+                ref new_tree_ids_hex,
+                ref conflict_labels,
+                ..
+            } if new_tree_ids_hex.is_empty() && conflict_labels.is_empty()
+        ));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

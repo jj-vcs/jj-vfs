@@ -549,11 +549,7 @@ impl NamespaceRouter {
         let ws_ref = self.resolve_workspace_ref(&key).await?;
         let backend = self.registry.resolve_repo(source, &canon_seg)?;
         let overlay = self.overlays.get_or_open(&key)?;
-        if let Some(local_jj) = &ws_ref.local_jj_dir
-            && overlay.synthesized_jj_dir().is_none()
-        {
-            overlay.set_synthesized_jj_dir(Some(local_jj.clone()));
-        }
+        self.ensure_workspace_jj_dir(&key, &canon_seg, &ws_ref, &overlay)?;
         overlay
             .get_virtual_entry(backend, ws_ref.commit_id_hex, &join_segments(rest))
             .await
@@ -582,12 +578,36 @@ impl NamespaceRouter {
         let repo_seg = encode_repo_segment(&key.repo);
         let backend = self.registry.resolve_repo(&key.source, &repo_seg)?;
         let overlay = self.overlays.get_or_open(&key)?;
-        if let Some(local_jj) = &ws_ref.local_jj_dir
-            && overlay.synthesized_jj_dir().is_none()
-        {
-            overlay.set_synthesized_jj_dir(Some(local_jj.clone()));
-        }
+        self.ensure_workspace_jj_dir(&key, &repo_seg, &ws_ref, &overlay)?;
         Ok((overlay, backend, ws_ref.commit_id_hex, rel_path))
+    }
+
+    fn ensure_workspace_jj_dir(
+        &self,
+        key: &WorkspaceKey,
+        repo_seg: &str,
+        ws_ref: &VfsWorkspaceRef,
+        overlay: &Arc<WorkspaceOverlay>,
+    ) -> Result<(), JjError> {
+        if overlay.synthesized_jj_dir().is_some() {
+            return Ok(());
+        }
+        if let Some(local_jj) = &ws_ref.local_jj_dir {
+            overlay.set_read_only_jj_dir(local_jj.clone());
+            return Ok(());
+        }
+        if let Some(cc) = self.registry.resolve_cc_repo(&key.source, repo_seg)? {
+            let paths = self.registry.paths();
+            let jj_dir = crate::snapshot::ensure_synthesized_cc_jj_dir(
+                &paths.state_dir,
+                &paths.socket_path,
+                key,
+                &cc,
+                ws_ref,
+            )?;
+            overlay.set_synthesized_jj_dir(Some(jj_dir));
+        }
+        Ok(())
     }
 }
 

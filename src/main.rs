@@ -89,6 +89,7 @@ fn main() -> anyhow::Result<()> {
     rt.block_on(runtime.mount_configured());
     let shutdown = Arc::new(Notify::new());
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    runtime.start_background_tasks(Arc::clone(&shutdown));
     let sd_sig = Arc::clone(&shutdown);
     let sd_tx = shutdown_tx.clone();
     rt.spawn(async move {

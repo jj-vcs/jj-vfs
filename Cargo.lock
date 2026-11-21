@@ -3016,6 +3016,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tokio-stream",
+ "toml 1.2.1+spec-1.1.0",
  "tonic",
  "tower 0.4.13",
  "tracing",

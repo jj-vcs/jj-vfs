@@ -3010,6 +3010,7 @@ dependencies = [
  "libc",
  "parking_lot",
  "pollster",
+ "serde",
  "serde_json",
  "tempfile",
  "thiserror",

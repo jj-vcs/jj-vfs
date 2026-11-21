@@ -44,6 +44,7 @@ pub mod inode_map;
 pub mod ipc_server;
 pub mod jj_error;
 pub mod namespace;
+pub mod overlay;
 pub mod path_mapper;
 pub mod path_mapper_all_commits;
 pub mod registry;

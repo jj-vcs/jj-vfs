@@ -71,6 +71,26 @@ impl FileAttributes {
     }
 }
 
+/// Attribute changes requested by FUSE `setattr`; `None` leaves the attribute
+/// unchanged.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AttributeChanges {
+    pub mode: Option<u32>,
+    pub size: Option<u64>,
+    pub atime: Option<SystemTime>,
+    pub mtime: Option<SystemTime>,
+}
+
+impl AttributeChanges {
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+
+    pub fn has_times(&self) -> bool {
+        self.atime.is_some() || self.mtime.is_some()
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct DirectoryEntry {
     pub name: String,

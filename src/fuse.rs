@@ -29,7 +29,7 @@ use crate::vfs::VirtualFilesystem;
 use crate::virtual_file::AttributeChanges;
 use crate::virtual_file::FileAttributes;
 
-const TTL: Duration = Duration::from_secs(1);
+const TTL: Duration = Duration::from_secs(60);
 
 macro_rules! reply_async {
     (

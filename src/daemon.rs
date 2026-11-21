@@ -55,6 +55,7 @@ use crate::snapshot::sync_synthesized_vfs_state_file;
 struct ActiveMountEntry {
     info: ActiveMountInfo,
     inode_map: Arc<InodeMap>,
+    notifier: fuser::Notifier,
     session: fuser::BackgroundSession,
 }
 
@@ -231,7 +232,7 @@ impl DaemonRuntime {
             scope,
             router_prefix,
         };
-        let _ = &inode_map;
+        let notifier = session.notifier();
         {
             let mut mounts = self.mounts.lock();
             mounts.insert(
@@ -239,6 +240,7 @@ impl DaemonRuntime {
                 ActiveMountEntry {
                     info: info.clone(),
                     inode_map,
+                    notifier,
                     session,
                 },
             );
@@ -267,16 +269,18 @@ impl DaemonRuntime {
     }
 
     /// Spawns the debounced ($2\text{ s}$ default) background snapshot worker
-    /// task.
+    /// task and the remote workspace head watcher.
     pub fn start_background_tasks(self: &Arc<Self>, shutdown: Arc<Notify>) {
         let rt = Arc::clone(self);
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(std::time::Duration::from_millis(250));
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut ticks: u64 = 0;
             loop {
                 tokio::select! {
                     _ = shutdown.notified() => break,
                     _ = ticker.tick() => {
+                        ticks = ticks.wrapping_add(1);
                         let debounce = std::time::Duration::from_millis(
                             rt.registry.snapshot_debounce_ms().max(50),
                         );
@@ -337,11 +341,80 @@ impl DaemonRuntime {
                             }
                         }
 
+                        // Every 8 ticks (~2s), check clean mounted Commit Cloud workspaces for remote head updates
+                        if ticks.is_multiple_of(8) {
+                            rt.poll_remote_workspace_heads().await;
+                        }
                     }
                 }
             }
         });
     }
+
+    async fn poll_remote_workspace_heads(&self) {
+        for (key, cached_ref) in self.router.active_workspace_heads() {
+            let ws_mutex = self.workspace_lock(&key);
+            let Ok(_ws_guard) = ws_mutex.try_lock() else {
+                continue;
+            };
+            if self
+                .pending_cli_snapshots
+                .get(&key)
+                .is_some_and(|t0| t0.elapsed() < std::time::Duration::from_secs(15))
+            {
+                continue;
+            }
+            if self.router.cached_workspace_head(&key).as_ref() != Some(&cached_ref) {
+                continue;
+            }
+            if let Ok(ovl) = self.overlays.get_or_open(&key)
+                && ovl.has_dirty_tracked_paths()
+            {
+                continue;
+            }
+            let repo_seg = encode_repo_segment(&key.repo);
+            let Ok(Some(cc)) = self.registry.resolve_cc_repo(&key.source, &repo_seg) else {
+                continue;
+            };
+            use crate::backend::ReadOnlyVfsBackend as _;
+            let Ok(remote_list) = cc.list_workspaces(Some(&key.user)).await else {
+                continue;
+            };
+            if self.router.cached_workspace_head(&key).as_ref() != Some(&cached_ref) {
+                continue;
+            }
+            if let Ok(ovl) = self.overlays.get_or_open(&key)
+                && ovl.has_dirty_tracked_paths()
+            {
+                continue;
+            }
+            if let Some(remote_ws) = remote_list
+                .into_iter()
+                .find(|w| w.workspace_name == key.workspace && w.user == key.user)
+                && (remote_ws.commit_id_hex != cached_ref.commit_id_hex
+                    || remote_ws.tree_id_hex != cached_ref.tree_id_hex
+                    || remote_ws.tree_ids_hex != cached_ref.tree_ids_hex)
+            {
+                let _ = self
+                    .checkout_tree_locked(
+                        key,
+                        CheckoutTreeOptions {
+                            old_tree_id_hex: Some(cached_ref.tree_id_hex),
+                            new_tree_id_hex: remote_ws.tree_id_hex,
+                            new_tree_ids_hex: remote_ws.tree_ids_hex,
+                            conflict_labels: remote_ws.conflict_labels,
+                            new_commit_id_hex: Some(remote_ws.commit_id_hex),
+                            new_operation_id_hex: (!remote_ws.operation_id_hex.is_empty())
+                                .then_some(remote_ws.operation_id_hex),
+                            captured_seq: None,
+                            publish_ws_state: false,
+                        },
+                    )
+                    .await;
+            }
+        }
+    }
+
     /// Executes an $O(k)$ dirty-path snapshot on `key`.
     pub async fn snapshot_workspace(
         &self,
@@ -354,6 +427,7 @@ impl DaemonRuntime {
 
         let ws_ref = self.router.resolve_workspace_ref(&key).await?;
         let overlay = self.overlays.get_or_open(&key)?;
+        let dirty_paths: Vec<String> = overlay.capture_dirty_snapshot().1.into_keys().collect();
         let repo_seg = encode_repo_segment(&key.repo);
 
         if let Some(cc) = self.registry.resolve_cc_repo(&key.source, &repo_seg)? {
@@ -372,6 +446,11 @@ impl DaemonRuntime {
                 self.pending_cli_snapshots.remove(&key);
                 self.skipped_bg_snapshots.remove(&key);
                 self.router.set_workspace_head(key.clone(), updated_ref);
+                if !dirty_paths.is_empty() {
+                    let mut inval = dirty_paths;
+                    inval.push(".jj/working_copy/vfs_state.json".to_string());
+                    self.invalidate_workspace_paths(&key, &inval).await;
+                }
             } else if res.captured_seq.is_some() {
                 self.pending_cli_snapshots
                     .insert(key.clone(), std::time::Instant::now());
@@ -386,6 +465,11 @@ impl DaemonRuntime {
                 self.pending_cli_snapshots.remove(&key);
                 self.skipped_bg_snapshots.remove(&key);
                 self.router.set_workspace_head(key.clone(), updated_ref);
+                if !dirty_paths.is_empty() {
+                    let mut inval = dirty_paths;
+                    inval.push(".jj/working_copy/vfs_state.json".to_string());
+                    self.invalidate_workspace_paths(&key, &inval).await;
+                }
             } else if res.captured_seq.is_some() {
                 self.pending_cli_snapshots
                     .insert(key.clone(), std::time::Instant::now());
@@ -562,18 +646,187 @@ impl DaemonRuntime {
             }
         }
 
-        let _ = (
-            &opts.old_tree_id_hex,
-            &served_old_tree_ids,
-            &completed_dirty_paths,
-        );
+        let mut changed_set = std::collections::BTreeSet::new();
+        let mut diff_failed = false;
+        match self.registry.resolve_repo(&key.source, &repo_seg) {
+            Ok(backend) => {
+                let mut old_candidates = vec![served_old_tree.clone()];
+                if let Some(caller_old) = opts.old_tree_id_hex
+                    && !old_candidates.contains(&caller_old)
+                {
+                    old_candidates.push(caller_old);
+                }
+                for extra_old in served_old_tree_ids {
+                    if !old_candidates.contains(&extra_old) {
+                        old_candidates.push(extra_old);
+                    }
+                }
+                for old_t in &old_candidates {
+                    for new_t in &effective_new_tree_ids {
+                        if old_t == new_t {
+                            continue;
+                        }
+                        match backend.diff_trees(old_t, new_t).await {
+                            Ok(diff) => changed_set.extend(diff),
+                            Err(err) => {
+                                tracing::warn!(
+                                    workspace = ?key,
+                                    error = %err,
+                                    "best-effort diff_trees failed after workspace head update"
+                                );
+                                diff_failed = true;
+                            }
+                        }
+                    }
+                }
+            }
+            Err(err) => {
+                tracing::warn!(
+                    workspace = ?key,
+                    error = %err,
+                    "failed to resolve backend for checkout invalidation"
+                );
+                diff_failed = true;
+            }
+        }
+
+        let changed_paths: Vec<String> = changed_set.iter().cloned().collect();
+        for p in completed_dirty_paths {
+            changed_set.insert(p);
+        }
+        changed_set.insert(".jj/working_copy/vfs_state.json".to_string());
+        let kernel_inval_paths: Vec<String> = changed_set.into_iter().collect();
+        self.invalidate_workspace_paths(&key, &kernel_inval_paths)
+            .await;
+        if diff_failed {
+            self.invalidate_workspace_root(&key).await;
+        }
+
         Ok(CheckoutTreeResult {
             workspace: key,
             old_tree_id_hex: served_old_tree,
             new_tree_id_hex: opts.new_tree_id_hex,
-            invalidated_paths: Vec::new(),
+            invalidated_paths: changed_paths,
             commit_id_hex: Some(resolved_commit_id_hex),
         })
+    }
+
+    /// Sends targeted kernel dentry (`inval_entry`) and page/attr
+    /// (`inval_inode`) invalidations to every active FUSE mount whose scope
+    /// covers `ws_key`.
+    pub async fn invalidate_workspace_paths(&self, ws_key: &WorkspaceKey, rel_paths: &[String]) {
+        if rel_paths.is_empty() {
+            return;
+        }
+        let repo_seg = encode_repo_segment(&ws_key.repo);
+        let canon_ws_prefix = PathBuf::from(&ws_key.source)
+            .join("repos")
+            .join(&repo_seg)
+            .join("users")
+            .join(&ws_key.user)
+            .join(&ws_key.workspace);
+
+        let batch = {
+            let guard = self.mounts.lock();
+            let mut collected = Vec::new();
+            for entry in guard.values() {
+                let mount_ws_rel = match &entry.info.scope {
+                    MountScope::User { source, user }
+                        if source == &ws_key.source && user == &ws_key.user =>
+                    {
+                        Some(PathBuf::from(&repo_seg).join(&ws_key.workspace))
+                    }
+                    _ => canon_ws_prefix
+                        .strip_prefix(&entry.info.router_prefix)
+                        .ok()
+                        .map(Path::to_path_buf),
+                };
+                let Some(ws_prefix_in_mount) = mount_ws_rel else {
+                    continue;
+                };
+
+                let mut items = Vec::new();
+                for rel in rel_paths {
+                    let mount_rel = if ws_prefix_in_mount.as_os_str().is_empty() {
+                        PathBuf::from(rel)
+                    } else {
+                        ws_prefix_in_mount.join(rel)
+                    };
+                    if let Some(resolved) = entry.inode_map.lookup_path_inodes(&mount_rel) {
+                        items.push(resolved);
+                    }
+                }
+                if !items.is_empty() {
+                    collected.push((entry.notifier.clone(), items));
+                }
+            }
+            collected
+        };
+
+        if batch.is_empty() {
+            return;
+        }
+        let _ = tokio::task::spawn_blocking(move || {
+            for (notifier, items) in batch {
+                for (child_opt, parent_ino, leaf) in items {
+                    if let Some(child_ino) = child_opt {
+                        let _ = notifier.inval_inode(child_ino, 0, 0);
+                    }
+                    let _ = notifier.inval_entry(parent_ino, std::ffi::OsStr::new(leaf.as_str()));
+                    let _ = notifier.inval_inode(parent_ino, -1, 0);
+                }
+            }
+        })
+        .await;
+    }
+
+    async fn invalidate_workspace_root(&self, ws_key: &WorkspaceKey) {
+        let repo_seg = encode_repo_segment(&ws_key.repo);
+        let canon_ws_prefix = PathBuf::from(&ws_key.source)
+            .join("repos")
+            .join(&repo_seg)
+            .join("users")
+            .join(&ws_key.user)
+            .join(&ws_key.workspace);
+
+        let roots: Vec<(fuser::Notifier, fuser::INodeNo)> = {
+            let guard = self.mounts.lock();
+            let mut out = Vec::new();
+            for entry in guard.values() {
+                let mount_ws_rel = match &entry.info.scope {
+                    MountScope::User { source, user }
+                        if source == &ws_key.source && user == &ws_key.user =>
+                    {
+                        Some(PathBuf::from(&repo_seg).join(&ws_key.workspace))
+                    }
+                    _ => canon_ws_prefix
+                        .strip_prefix(&entry.info.router_prefix)
+                        .ok()
+                        .map(Path::to_path_buf),
+                };
+                let Some(ws_prefix_in_mount) = mount_ws_rel else {
+                    continue;
+                };
+                if ws_prefix_in_mount.as_os_str().is_empty() {
+                    out.push((entry.notifier.clone(), crate::inode_map::ROOT_INODE));
+                } else if let Some((Some(ws_ino), _, _)) =
+                    entry.inode_map.lookup_path_inodes(&ws_prefix_in_mount)
+                {
+                    out.push((entry.notifier.clone(), ws_ino));
+                }
+            }
+            out
+        };
+
+        if roots.is_empty() {
+            return;
+        }
+        let _ = tokio::task::spawn_blocking(move || {
+            for (notifier, ino) in roots {
+                let _ = notifier.inval_inode(ino, -1, 0);
+            }
+        })
+        .await;
     }
 
     async fn flush_all_dirty_overlays(&self) {
@@ -1591,6 +1844,185 @@ mod tests {
         ));
 
         shutdown.notify_waiters();
+        runtime.unmount_all().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn checkout_tree_invalidates_60s_kernel_cache_and_pins_unacknowledged_overlay_files() {
+        if !fuse_available() {
+            eprintln!("skipping FUSE test: /dev/fuse unavailable");
+            return;
+        }
+        use jj_lib::backend::CopyId;
+        use jj_lib::backend::TreeValue;
+        use jj_lib::merged_tree::MergedTree;
+        use jj_lib::repo::Repo as _;
+        use jj_lib::repo_path::RepoPathBuf;
+        use jj_lib::tree_builder::TreeBuilder;
+
+        let (ws_a, repo_a, cid_v1) = setup_test_repo().await;
+
+        // Build a second commit `cid_v2` in `repo_a` modifying ONLY `file1.txt`
+        // (leaving `dir/file2.txt` untouched)
+        let store = repo_a.store().clone();
+        let c1 = store.get_commit(&cid_v1).unwrap();
+        let tid_v1 = c1.tree_ids().as_resolved().unwrap().clone();
+        let mut tb = TreeBuilder::new(Arc::clone(&store), tid_v1.clone());
+        let file1_rp = RepoPathBuf::from_internal_string("file1.txt").unwrap();
+        let new_fid = store
+            .write_file(&file1_rp, &mut &b"updated via checkout_tree!"[..])
+            .await
+            .unwrap();
+        tb.set(
+            file1_rp,
+            TreeValue::File {
+                id: new_fid,
+                executable: false,
+                copy_id: CopyId::placeholder(),
+            },
+        );
+        let tid_v2 = tb.write_tree().await.unwrap();
+
+        let mut tx = repo_a.start_transaction();
+        let c2 = tx
+            .repo_mut()
+            .new_commit(
+                vec![cid_v1.clone()],
+                MergedTree::resolved(Arc::clone(&store), tid_v2.clone()),
+            )
+            .set_description("v2 commit")
+            .write()
+            .await
+            .unwrap();
+        let committed_repo = tx.commit("add v2 commit").await.unwrap();
+
+        // Configure tight 64-byte CAS eviction budget to test overlay pinning
+        // simultaneously
+        let state_dir = tempfile::tempdir().unwrap();
+        let paths = InstancePaths::resolve(Some("inval-test"), Some(state_dir.path()));
+        paths.ensure_dirs().unwrap();
+        let mut cfg = vfs_proto::VfsConfigFile::default();
+        cfg.daemon.max_cache_bytes = 64;
+        cfg.daemon.snapshot_debounce_ms = 60_000;
+        cfg.save_atomic(&paths.config_path).unwrap();
+
+        let runtime = DaemonRuntime::new(paths).unwrap();
+        let repo_name = ws_a
+            .path()
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        runtime
+            .registry()
+            .add_source(
+                "local".into(),
+                SourceConfig {
+                    kind: SourceKind::LocalJj,
+                    url: None,
+                    daemon_socket: None,
+                    user: None,
+                    auth_token_env: None,
+                    auth_token_cmd: vec![],
+                    path: Some(ws_a.path().to_path_buf()),
+                    search_paths: vec![],
+                    repos: BTreeMap::new(),
+                    ephemeral: true,
+                },
+            )
+            .unwrap();
+
+        let root_mnt = tempfile::tempdir().unwrap();
+        let ws_mnt = tempfile::tempdir().unwrap();
+        runtime
+            .mount_target(None, root_mnt.path().to_path_buf(), false)
+            .await
+            .unwrap();
+        runtime
+            .mount_target(
+                Some(format!("local:{repo_name}/default")),
+                ws_mnt.path().to_path_buf(),
+                false,
+            )
+            .await
+            .unwrap();
+
+        for _ in 0..30 {
+            if ws_mnt.path().join("file1.txt").exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        }
+
+        // Warm 60s kernel page & dentry cache on BOTH mounts!
+        let root_file1 = root_mnt
+            .path()
+            .join("local/repos")
+            .join(&repo_name)
+            .join("users/local/default/file1.txt");
+        assert_eq!(
+            std::fs::read_to_string(ws_mnt.path().join("file1.txt")).unwrap(),
+            "hello content 1"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&root_file1).unwrap(),
+            "hello content 1"
+        );
+
+        // Switch workspace to `c2` via `checkout_tree` -> must diff only
+        // `file1.txt` and invalidate 60s kernel cache!
+        let ws_key = WorkspaceKey {
+            source: "local".into(),
+            repo: repo_name.clone(),
+            user: "local".into(),
+            workspace: "default".into(),
+        };
+        let co_res = runtime
+            .checkout_tree(
+                ws_key.clone(),
+                Some(tid_v1.hex()),
+                tid_v2.hex(),
+                Some(c2.id().hex()),
+                Some(committed_repo.op_id().hex()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(co_res.invalidated_paths, vec!["file1.txt".to_string()]);
+
+        // Immediately (<10ms, well inside the 60s kernel TTL!) read both mounts
+        // -> must see v2!
+        assert_eq!(
+            std::fs::read_to_string(ws_mnt.path().join("file1.txt")).unwrap(),
+            "updated via checkout_tree!"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&root_file1).unwrap(),
+            "updated via checkout_tree!"
+        );
+
+        // Write an un-snapshotted 120-byte file in `overlay/staged/` and churn
+        // `BlobCas` past its 64-byte cap!
+        let pinned_payload = "U".repeat(120);
+        std::fs::write(ws_mnt.path().join("unacked.txt"), &pinned_payload).unwrap();
+        for idx in 0..20 {
+            runtime
+                .registry()
+                .cas()
+                .put_blob(&format!("cold_blob_{idx}"), &[b'C'; 48])
+                .unwrap();
+        }
+        assert!(runtime.registry().cas().stats().1 <= 64);
+        // Unacknowledged staged file lives outside `BlobCas` and is NEVER
+        // evicted!
+        assert_eq!(
+            std::fs::read_to_string(ws_mnt.path().join("unacked.txt")).unwrap(),
+            pinned_payload
+        );
+
+        // Clean up overlay before unmount so local repo doesn't need to commit
+        // `unacked.txt`
+        std::fs::remove_file(ws_mnt.path().join("unacked.txt")).unwrap();
         runtime.unmount_all().await;
     }
 

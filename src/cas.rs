@@ -135,7 +135,6 @@ impl<K: Clone + Eq + Hash, V> LruMap<K, V> {
     }
 
     /// Iterates over keys from least to most recently used.
-    #[allow(dead_code)]
     pub(crate) fn keys(&self) -> impl Iterator<Item = &K> {
         self.order.values()
     }

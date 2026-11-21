@@ -255,7 +255,28 @@ impl From<JjError> for Errno {
             JjError::NotFound => Errno::ENOENT,
             JjError::NotADirectory => Errno::ENOTDIR,
             JjError::NotAFile => Errno::EISDIR,
-            JjError::NotASymlink => Errno::EINVAL,
+            JjError::NotASymlink | JjError::InvalidPath => Errno::EINVAL,
+            JjError::ReadOnly => Errno::EROFS,
+            JjError::PermissionDenied(_) => Errno::EACCES,
+            JjError::CrossDevice => Errno::EXDEV,
+            JjError::DirectoryNotEmpty => Errno::ENOTEMPTY,
+            JjError::AlreadyExists => Errno::EEXIST,
+            JjError::Busy => Errno::EBUSY,
+            JjError::IO(e) => e
+                .raw_os_error()
+                .filter(|&code| code > 0)
+                .map(Errno::from_i32)
+                .unwrap_or_else(|| match e.kind() {
+                    std::io::ErrorKind::NotFound => Errno::ENOENT,
+                    std::io::ErrorKind::AlreadyExists => Errno::EEXIST,
+                    std::io::ErrorKind::PermissionDenied => Errno::EACCES,
+                    std::io::ErrorKind::DirectoryNotEmpty => Errno::ENOTEMPTY,
+                    std::io::ErrorKind::IsADirectory => Errno::EISDIR,
+                    std::io::ErrorKind::NotADirectory => Errno::ENOTDIR,
+                    std::io::ErrorKind::InvalidInput => Errno::EINVAL,
+                    std::io::ErrorKind::StorageFull => Errno::ENOSPC,
+                    _ => Errno::EIO,
+                }),
             _ => Errno::EIO,
         }
     }

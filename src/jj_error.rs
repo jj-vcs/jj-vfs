@@ -31,9 +31,68 @@ pub enum JjError {
     #[error("Expected a symlink")]
     NotASymlink,
 
+    #[error("Read-only filesystem path")]
+    ReadOnly,
+
+    #[error("Permission denied: {0}")]
+    PermissionDenied(String),
+
+    #[error("Cross-workspace link or rename is not permitted")]
+    CrossDevice,
+
+    #[error("Directory is not empty")]
+    DirectoryNotEmpty,
+
+    #[error("Entry already exists")]
+    AlreadyExists,
+
+    #[error("Resource is busy")]
+    Busy,
+
     #[error("{0}")]
     IO(#[from] std::io::Error),
 
     #[error("Underlying jj-lib error: {0}")]
     JjLibBackendError(#[from] jj_lib::backend::BackendError),
+
+    #[error("Commit Cloud gRPC error: {0}")]
+    Grpc(String),
+}
+
+impl From<tonic::Status> for JjError {
+    fn from(status: tonic::Status) -> Self {
+        match status.code() {
+            tonic::Code::NotFound => Self::NotFound,
+            tonic::Code::InvalidArgument => Self::InvalidPath,
+            tonic::Code::AlreadyExists => Self::AlreadyExists,
+            tonic::Code::PermissionDenied | tonic::Code::Unauthenticated => {
+                Self::PermissionDenied(format!("{}: {}", status.code(), status.message()))
+            }
+            _ => Self::Grpc(status.to_string()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn grpc_auth_errors_map_to_permission_denied_with_server_message() {
+        let unauth = JjError::from(tonic::Status::unauthenticated("token expired"));
+        match &unauth {
+            JjError::PermissionDenied(msg) => assert!(msg.contains("token expired"), "{msg}"),
+            other => panic!("expected PermissionDenied, got {other:?}"),
+        }
+        assert_eq!(fuser::Errno::from(unauth), fuser::Errno::EACCES);
+
+        let denied = JjError::from(tonic::Status::permission_denied("missing scope repo.read"));
+        match &denied {
+            JjError::PermissionDenied(msg) => {
+                assert!(msg.contains("missing scope repo.read"), "{msg}");
+            }
+            other => panic!("expected PermissionDenied, got {other:?}"),
+        }
+        assert_eq!(fuser::Errno::from(denied), fuser::Errno::EACCES);
+    }
 }

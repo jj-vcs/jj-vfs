@@ -29,6 +29,7 @@
 //! (`read_file_range`) serve `[offset, offset+size)` directly from `BlobCas`
 //! (`pread`) or ranged `ReadFile` gRPC streams.
 
+pub mod commit_cloud;
 pub mod local;
 
 use std::collections::BTreeMap;

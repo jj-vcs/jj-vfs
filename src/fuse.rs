@@ -14,6 +14,7 @@
 
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::SystemTime;
@@ -25,6 +26,7 @@ use futures::stream;
 use crate::inode_map::InodeMap;
 use crate::jj_error::JjError;
 use crate::vfs::VirtualFilesystem;
+use crate::virtual_file::AttributeChanges;
 use crate::virtual_file::FileAttributes;
 
 const TTL: Duration = Duration::from_secs(1);
@@ -214,6 +216,306 @@ impl<FS: VirtualFilesystem + Send + Sync + 'static> Filesystem for JjFuse<FS> {
             target => reply.data(&target)
         );
     }
+
+    #[tracing::instrument(level = "debug", skip(self, _req, reply))]
+    fn open(&self, _req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
+        let fs = self.fs.clone();
+        let acc = flags.0 & libc::O_ACCMODE;
+        let write_access = acc == libc::O_WRONLY || acc == libc::O_RDWR;
+        let truncate = (flags.0 & libc::O_TRUNC) != 0;
+        reply_async!(
+            self,
+            reply,
+            ino,
+            path => async move {
+                fs.open_file(path, write_access, truncate).await?;
+                Ok(())
+            },
+            () => reply.opened(FileHandle(0), FopenFlags::empty())
+        );
+    }
+
+    #[tracing::instrument(level = "debug", skip(self, _req, reply))]
+    fn create(
+        &self,
+        _req: &Request,
+        parent: INodeNo,
+        name: &OsStr,
+        mode: u32,
+        umask: u32,
+        flags: i32,
+        reply: ReplyCreate,
+    ) {
+        let fs = self.fs.clone();
+        let inode_map = self.inode_map.clone();
+        let name = name.to_os_string();
+        let executable = ((mode & !umask) & 0o111) != 0;
+        let exclusive = (flags & libc::O_EXCL) != 0;
+        reply_async!(
+            self,
+            reply,
+            parent,
+            parent_path => async move {
+                let name_str = name.to_str().ok_or(JjError::InvalidPath)?;
+                parent_path.push(name_str);
+                let attr = fs.create_file(parent_path, executable, exclusive).await?;
+                let child_ino = inode_map.get_ino(parent, name_str)?;
+                Ok(attr.to_fuse(child_ino))
+            },
+            attr => {
+                reply.created(&TTL, &attr, fuser::Generation(0), FileHandle(0), FopenFlags::empty())
+            }
+        );
+    }
+
+    #[tracing::instrument(level = "debug", skip(self, _req, data, reply))]
+    fn write(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        _fh: FileHandle,
+        offset: u64,
+        data: &[u8],
+        _write_flags: WriteFlags,
+        _flags: OpenFlags,
+        _lock_owner: Option<LockOwner>,
+        reply: ReplyWrite,
+    ) {
+        let fs = self.fs.clone();
+        let owned = data.to_vec();
+        reply_async!(
+            self,
+            reply,
+            ino,
+            path => async move { fs.write(path, offset, &owned).await },
+            written => reply.written(written)
+        );
+    }
+
+    #[tracing::instrument(level = "debug", skip(self, _req, reply))]
+    fn flush(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        _fh: FileHandle,
+        _lock_owner: LockOwner,
+        reply: ReplyEmpty,
+    ) {
+        reply.ok();
+    }
+
+    #[tracing::instrument(level = "debug", skip(self, _req, reply))]
+    fn fsync(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        _fh: FileHandle,
+        datasync: bool,
+        reply: ReplyEmpty,
+    ) {
+        let fs = self.fs.clone();
+        reply_async!(
+            self,
+            reply,
+            ino,
+            path => async move { fs.fsync(path, datasync).await },
+            () => reply.ok()
+        );
+    }
+
+    #[tracing::instrument(level = "debug", skip(self, _req, reply))]
+    fn fsyncdir(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        _fh: FileHandle,
+        datasync: bool,
+        reply: ReplyEmpty,
+    ) {
+        let fs = self.fs.clone();
+        reply_async!(
+            self,
+            reply,
+            ino,
+            path => async move { fs.fsync(path, datasync).await },
+            () => reply.ok()
+        );
+    }
+
+    #[tracing::instrument(level = "debug", skip(self, _req, reply))]
+    fn setattr(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        mode: Option<u32>,
+        _uid: Option<u32>,
+        _gid: Option<u32>,
+        size: Option<u64>,
+        atime: Option<TimeOrNow>,
+        mtime: Option<TimeOrNow>,
+        _ctime: Option<SystemTime>,
+        _fh: Option<FileHandle>,
+        _crtime: Option<SystemTime>,
+        _chgtime: Option<SystemTime>,
+        _bkuptime: Option<SystemTime>,
+        _flags: Option<BsdFileFlags>,
+        reply: ReplyAttr,
+    ) {
+        let fs = self.fs.clone();
+        let changes = AttributeChanges {
+            mode,
+            size,
+            atime: atime.map(time_or_now_to_system_time),
+            mtime: mtime.map(time_or_now_to_system_time),
+        };
+        reply_async!(
+            self,
+            reply,
+            ino,
+            path => async move {
+                let attr = fs.set_attributes(path, changes).await?;
+                Ok(attr.to_fuse(ino))
+            },
+            attr => reply.attr(&TTL, &attr)
+        );
+    }
+
+    #[tracing::instrument(level = "debug", skip(self, _req, reply))]
+    fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        let fs = self.fs.clone();
+        let inode_map = self.inode_map.clone();
+        let name = name.to_os_string();
+        reply_async!(
+            self,
+            reply,
+            parent,
+            parent_path => async move {
+                let name_str = name.to_str().ok_or(JjError::InvalidPath)?;
+                parent_path.push(name_str);
+                fs.unlink(parent_path).await?;
+                inode_map.remove_entry(parent, name_str);
+                Ok(())
+            },
+            () => reply.ok()
+        );
+    }
+
+    #[tracing::instrument(level = "debug", skip(self, _req, reply))]
+    fn mkdir(
+        &self,
+        _req: &Request,
+        parent: INodeNo,
+        name: &OsStr,
+        mode: u32,
+        umask: u32,
+        reply: ReplyEntry,
+    ) {
+        let fs = self.fs.clone();
+        let inode_map = self.inode_map.clone();
+        let name = name.to_os_string();
+        let effective_mode = mode & !umask;
+        reply_async!(
+            self,
+            reply,
+            parent,
+            parent_path => async move {
+                let name_str = name.to_str().ok_or(JjError::InvalidPath)?;
+                parent_path.push(name_str);
+                let attr = fs.mkdir(parent_path, effective_mode).await?;
+                let child_ino = inode_map.get_ino(parent, name_str)?;
+                Ok(attr.to_fuse(child_ino))
+            },
+            attr => reply.entry(&TTL, &attr, fuser::Generation(0))
+        );
+    }
+
+    #[tracing::instrument(level = "debug", skip(self, _req, reply))]
+    fn rmdir(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        let fs = self.fs.clone();
+        let inode_map = self.inode_map.clone();
+        let name = name.to_os_string();
+        reply_async!(
+            self,
+            reply,
+            parent,
+            parent_path => async move {
+                let name_str = name.to_str().ok_or(JjError::InvalidPath)?;
+                parent_path.push(name_str);
+                fs.rmdir(parent_path).await?;
+                inode_map.remove_entry(parent, name_str);
+                Ok(())
+            },
+            () => reply.ok()
+        );
+    }
+
+    #[tracing::instrument(level = "debug", skip(self, _req, reply))]
+    fn symlink(
+        &self,
+        _req: &Request,
+        parent: INodeNo,
+        link_name: &OsStr,
+        target: &Path,
+        reply: ReplyEntry,
+    ) {
+        let fs = self.fs.clone();
+        let inode_map = self.inode_map.clone();
+        let name = link_name.to_os_string();
+        let owned_target = target.to_path_buf();
+        reply_async!(
+            self,
+            reply,
+            parent,
+            parent_path => async move {
+                let name_str = name.to_str().ok_or(JjError::InvalidPath)?;
+                parent_path.push(name_str);
+                let attr = fs.symlink(parent_path, &owned_target).await?;
+                let child_ino = inode_map.get_ino(parent, name_str)?;
+                Ok(attr.to_fuse(child_ino))
+            },
+            attr => reply.entry(&TTL, &attr, fuser::Generation(0))
+        );
+    }
+
+    #[tracing::instrument(level = "debug", skip(self, _req, reply))]
+    fn rename(
+        &self,
+        _req: &Request,
+        parent: INodeNo,
+        name: &OsStr,
+        newparent: INodeNo,
+        newname: &OsStr,
+        flags: RenameFlags,
+        reply: ReplyEmpty,
+    ) {
+        if !flags.is_empty() {
+            reply.error(Errno::EINVAL);
+            return;
+        }
+        let fs = self.fs.clone();
+        let inode_map = self.inode_map.clone();
+        let old_name = name.to_os_string();
+        let new_name = newname.to_os_string();
+        let rt_handle = self.rt_handle.clone();
+        rt_handle.spawn(async move {
+            let res: Result<(), JjError> = async {
+                let old_str = old_name.to_str().ok_or(JjError::InvalidPath)?;
+                let new_str = new_name.to_str().ok_or(JjError::InvalidPath)?;
+                let mut old_path = inode_map.get_path(parent)?;
+                old_path.push(old_str);
+                let mut new_path = inode_map.get_path(newparent)?;
+                new_path.push(new_str);
+                fs.rename(&old_path, &new_path).await?;
+                inode_map.rename_entry(parent, old_str, newparent, new_str)?;
+                Ok(())
+            }
+            .await;
+            match res {
+                Ok(()) => reply.ok(),
+                Err(err) => reply.error(err.into()),
+            }
+        });
+    }
 }
 
 impl FileAttributes {
@@ -262,6 +564,13 @@ impl From<crate::virtual_file::FileType> for FileType {
     }
 }
 
+fn time_or_now_to_system_time(t: TimeOrNow) -> SystemTime {
+    match t {
+        TimeOrNow::SpecificTime(st) => st,
+        TimeOrNow::Now => SystemTime::now(),
+    }
+}
+
 impl From<JjError> for Errno {
     fn from(value: JjError) -> Self {
         match value {
@@ -292,5 +601,26 @@ impl From<JjError> for Errno {
                 }),
             _ => Errno::EIO,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn io_errors_preserve_host_errno_instead_of_collapsing_to_eio() {
+        for raw in [
+            libc::ENOSPC,
+            libc::EEXIST,
+            libc::ENAMETOOLONG,
+            libc::ENOTEMPTY,
+            libc::EACCES,
+        ] {
+            let err = JjError::IO(std::io::Error::from_raw_os_error(raw));
+            assert_eq!(Errno::from(err), Errno::from_i32(raw));
+        }
+        let custom = JjError::IO(std::io::Error::other("synthetic failure"));
+        assert_eq!(Errno::from(custom), Errno::EIO);
     }
 }

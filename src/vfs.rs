@@ -20,6 +20,7 @@ use async_trait::async_trait;
 
 use crate::jj_error::JjError;
 use crate::path_mapper::PathMapper;
+use crate::virtual_file::AttributeChanges;
 use crate::virtual_file::DirectoryStream;
 use crate::virtual_file::FileAttributes;
 
@@ -32,6 +33,63 @@ pub trait VirtualFilesystem {
     async fn read(&self, path: &Path, offset: u64, size: u32) -> Result<Box<[u8]>, JjError>;
     async fn read_directory(&self, path: &Path) -> Result<DirectoryStream, JjError>;
     async fn read_link(&self, path: &Path) -> Result<PathBuf, JjError>;
+
+    async fn open_file(
+        &self,
+        path: &Path,
+        write_access: bool,
+        truncate: bool,
+    ) -> Result<FileAttributes, JjError> {
+        if write_access || truncate {
+            return Err(JjError::ReadOnly);
+        }
+        self.get_attributes(path).await
+    }
+
+    async fn create_file(
+        &self,
+        _path: &Path,
+        _executable: bool,
+        _exclusive: bool,
+    ) -> Result<FileAttributes, JjError> {
+        Err(JjError::ReadOnly)
+    }
+
+    async fn write(&self, _path: &Path, _offset: u64, _data: &[u8]) -> Result<u32, JjError> {
+        Err(JjError::ReadOnly)
+    }
+
+    async fn fsync(&self, _path: &Path, _datasync: bool) -> Result<(), JjError> {
+        Ok(())
+    }
+
+    async fn set_attributes(
+        &self,
+        _path: &Path,
+        _changes: AttributeChanges,
+    ) -> Result<FileAttributes, JjError> {
+        Err(JjError::ReadOnly)
+    }
+
+    async fn unlink(&self, _path: &Path) -> Result<(), JjError> {
+        Err(JjError::ReadOnly)
+    }
+
+    async fn mkdir(&self, _path: &Path, _mode: u32) -> Result<FileAttributes, JjError> {
+        Err(JjError::ReadOnly)
+    }
+
+    async fn rmdir(&self, _path: &Path) -> Result<(), JjError> {
+        Err(JjError::ReadOnly)
+    }
+
+    async fn symlink(&self, _link_path: &Path, _target: &Path) -> Result<FileAttributes, JjError> {
+        Err(JjError::ReadOnly)
+    }
+
+    async fn rename(&self, _old_path: &Path, _new_path: &Path) -> Result<(), JjError> {
+        Err(JjError::ReadOnly)
+    }
 }
 
 pub struct PathMappedVfs<P: PathMapper> {

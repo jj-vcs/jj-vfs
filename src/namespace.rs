@@ -49,29 +49,41 @@ use crate::backend::BackendCommitNode;
 use crate::backend::VfsWorkspaceRef;
 use crate::backend::VirtualSymlinkNode;
 use crate::jj_error::JjError;
+use crate::overlay::OverlayManager;
+use crate::overlay::WorkspaceOverlay;
 use crate::path_mapper::PathMapper;
 use crate::registry::SourceRegistry;
 use crate::registry::expand_tilde;
 use crate::static_directory::StaticDirectory;
+use crate::vfs::VirtualFilesystem;
+use crate::virtual_file::AttributeChanges;
 use crate::virtual_file::DirectoryEntry;
+use crate::virtual_file::DirectoryStream;
+use crate::virtual_file::FileAttributes;
 use crate::virtual_file::FileType;
 use crate::virtual_file::VirtualFile;
 
 pub struct NamespaceRouter {
     registry: Arc<SourceRegistry>,
+    overlays: Arc<OverlayManager>,
     workspace_heads: DashMap<WorkspaceKey, VfsWorkspaceRef>,
 }
 
 impl NamespaceRouter {
-    pub fn new(registry: Arc<SourceRegistry>) -> Self {
+    pub fn new(registry: Arc<SourceRegistry>, overlays: Arc<OverlayManager>) -> Self {
         Self {
             registry,
+            overlays,
             workspace_heads: DashMap::new(),
         }
     }
 
     pub fn registry(&self) -> &Arc<SourceRegistry> {
         &self.registry
+    }
+
+    pub fn overlays(&self) -> &Arc<OverlayManager> {
+        &self.overlays
     }
 
     /// Canonicalizes a repo segment for `LocalJj` and `LocalGit` sources, where
@@ -129,6 +141,14 @@ impl NamespaceRouter {
     /// backends.
     pub fn cached_workspace_head(&self, key: &WorkspaceKey) -> Option<VfsWorkspaceRef> {
         self.workspace_heads.get(key).map(|r| r.clone())
+    }
+
+    /// Returns all workspaces currently cached in `NamespaceRouter`.
+    pub fn active_workspace_heads(&self) -> Vec<(WorkspaceKey, VfsWorkspaceRef)> {
+        self.workspace_heads
+            .iter()
+            .map(|item| (item.key().clone(), item.value().clone()))
+            .collect()
     }
 
     /// Returns cached head metadata for `key`, or resolves it from the backend.
@@ -528,11 +548,46 @@ impl NamespaceRouter {
         let canon_seg = encode_repo_segment(&key.repo);
         let ws_ref = self.resolve_workspace_ref(&key).await?;
         let backend = self.registry.resolve_repo(source, &canon_seg)?;
-        Ok(Box::new(BackendCommitNode::new(
-            backend,
-            ws_ref.commit_id_hex,
-            join_segments(rest),
-        )))
+        let overlay = self.overlays.get_or_open(&key)?;
+        if let Some(local_jj) = &ws_ref.local_jj_dir
+            && overlay.synthesized_jj_dir().is_none()
+        {
+            overlay.set_synthesized_jj_dir(Some(local_jj.clone()));
+        }
+        overlay
+            .get_virtual_entry(backend, ws_ref.commit_id_hex, &join_segments(rest))
+            .await
+    }
+
+    /// Resolves `(overlay, backend, base_commit_hex, rel_path)` for a mutable
+    /// workspace path, returning `Err(JjError::ReadOnly)` if `router_path` lies
+    /// outside a workspace (such as `commits/`, `bookmarks/`, `changes/`, or
+    /// static category directories).
+    pub async fn resolve_mutable_workspace(
+        &self,
+        router_path: &Path,
+    ) -> Result<
+        (
+            Arc<WorkspaceOverlay>,
+            Arc<dyn crate::backend::ReadOnlyVfsBackend>,
+            String,
+            PathBuf,
+        ),
+        JjError,
+    > {
+        let Some((key, rel_path)) = self.parse_workspace_path(router_path)? else {
+            return Err(JjError::ReadOnly);
+        };
+        let ws_ref = self.resolve_workspace_ref(&key).await?;
+        let repo_seg = encode_repo_segment(&key.repo);
+        let backend = self.registry.resolve_repo(&key.source, &repo_seg)?;
+        let overlay = self.overlays.get_or_open(&key)?;
+        if let Some(local_jj) = &ws_ref.local_jj_dir
+            && overlay.synthesized_jj_dir().is_none()
+        {
+            overlay.set_synthesized_jj_dir(Some(local_jj.clone()));
+        }
+        Ok((overlay, backend, ws_ref.commit_id_hex, rel_path))
     }
 }
 
@@ -634,6 +689,187 @@ impl PathMapper for SubtreePathMapper {
     }
 }
 
+/// Full read-write `VirtualFilesystem` binding a `SubtreePathMapper` session to
+/// `NamespaceRouter` and `WorkspaceOverlay`, enforcing `EROFS` on immutable
+/// `commits/`/`bookmarks/`/`changes/` paths and `EXDEV` across distinct
+/// workspaces.
+pub struct RouterVfs {
+    mapper: SubtreePathMapper,
+}
+
+impl RouterVfs {
+    pub fn new(mapper: SubtreePathMapper) -> Self {
+        Self { mapper }
+    }
+}
+
+#[async_trait]
+impl VirtualFilesystem for RouterVfs {
+    async fn get_attributes(&self, path: &Path) -> Result<FileAttributes, JjError> {
+        self.mapper.get_entry(path).await?.attributes().await
+    }
+
+    async fn read(&self, path: &Path, offset: u64, size: u32) -> Result<Box<[u8]>, JjError> {
+        self.mapper
+            .get_entry(path)
+            .await?
+            .read_range(offset, size)
+            .await
+    }
+
+    async fn read_directory(&self, path: &Path) -> Result<DirectoryStream, JjError> {
+        self.mapper.get_entry(path).await?.list().await
+    }
+
+    async fn read_link(&self, path: &Path) -> Result<PathBuf, JjError> {
+        self.mapper.get_entry(path).await?.read_link().await
+    }
+
+    async fn open_file(
+        &self,
+        path: &Path,
+        write_access: bool,
+        truncate: bool,
+    ) -> Result<FileAttributes, JjError> {
+        if !write_access && !truncate {
+            return self.get_attributes(path).await;
+        }
+        let router_path = self.mapper.to_router_path(path)?;
+        let (overlay, backend, base_hex, rel_path) = self
+            .mapper
+            .router()
+            .resolve_mutable_workspace(&router_path)
+            .await?;
+        overlay
+            .open_file(&backend, &base_hex, &rel_path, write_access, truncate)
+            .await
+    }
+
+    async fn create_file(
+        &self,
+        path: &Path,
+        executable: bool,
+        exclusive: bool,
+    ) -> Result<FileAttributes, JjError> {
+        let router_path = self.mapper.to_router_path(path)?;
+        let (overlay, backend, base_hex, rel_path) = self
+            .mapper
+            .router()
+            .resolve_mutable_workspace(&router_path)
+            .await?;
+        overlay
+            .create_file(&backend, &base_hex, &rel_path, executable, exclusive)
+            .await
+    }
+
+    async fn write(&self, path: &Path, offset: u64, data: &[u8]) -> Result<u32, JjError> {
+        let router_path = self.mapper.to_router_path(path)?;
+        let (overlay, backend, base_hex, rel_path) = self
+            .mapper
+            .router()
+            .resolve_mutable_workspace(&router_path)
+            .await?;
+        overlay
+            .write_at(&backend, &base_hex, &rel_path, offset, data)
+            .await
+    }
+
+    async fn fsync(&self, path: &Path, datasync: bool) -> Result<(), JjError> {
+        let router_path = self.mapper.to_router_path(path)?;
+        if let Ok((overlay, _, _, rel_path)) = self
+            .mapper
+            .router()
+            .resolve_mutable_workspace(&router_path)
+            .await
+        {
+            overlay.fsync(&rel_path, datasync).await?;
+        }
+        Ok(())
+    }
+
+    async fn set_attributes(
+        &self,
+        path: &Path,
+        changes: AttributeChanges,
+    ) -> Result<FileAttributes, JjError> {
+        let router_path = self.mapper.to_router_path(path)?;
+        let (overlay, backend, base_hex, rel_path) = self
+            .mapper
+            .router()
+            .resolve_mutable_workspace(&router_path)
+            .await?;
+        overlay
+            .set_attributes(&backend, &base_hex, &rel_path, changes)
+            .await
+    }
+
+    async fn unlink(&self, path: &Path) -> Result<(), JjError> {
+        let router_path = self.mapper.to_router_path(path)?;
+        let (overlay, backend, base_hex, rel_path) = self
+            .mapper
+            .router()
+            .resolve_mutable_workspace(&router_path)
+            .await?;
+        overlay.unlink(&backend, &base_hex, &rel_path).await
+    }
+
+    async fn mkdir(&self, path: &Path, mode: u32) -> Result<FileAttributes, JjError> {
+        let router_path = self.mapper.to_router_path(path)?;
+        let (overlay, backend, base_hex, rel_path) = self
+            .mapper
+            .router()
+            .resolve_mutable_workspace(&router_path)
+            .await?;
+        overlay.mkdir(&backend, &base_hex, &rel_path, mode).await
+    }
+
+    async fn rmdir(&self, path: &Path) -> Result<(), JjError> {
+        let router_path = self.mapper.to_router_path(path)?;
+        let (overlay, backend, base_hex, rel_path) = self
+            .mapper
+            .router()
+            .resolve_mutable_workspace(&router_path)
+            .await?;
+        overlay.rmdir(&backend, &base_hex, &rel_path).await
+    }
+
+    async fn symlink(&self, link_path: &Path, target: &Path) -> Result<FileAttributes, JjError> {
+        let router_path = self.mapper.to_router_path(link_path)?;
+        let (overlay, backend, base_hex, rel_path) = self
+            .mapper
+            .router()
+            .resolve_mutable_workspace(&router_path)
+            .await?;
+        overlay
+            .symlink(&backend, &base_hex, &rel_path, target)
+            .await
+    }
+
+    async fn rename(&self, old_path: &Path, new_path: &Path) -> Result<(), JjError> {
+        let old_router = self.mapper.to_router_path(old_path)?;
+        let new_router = self.mapper.to_router_path(new_path)?;
+        let Some((old_key, old_rel)) = self.mapper.router().parse_workspace_path(&old_router)?
+        else {
+            return Err(JjError::ReadOnly);
+        };
+        let Some((new_key, new_rel)) = self.mapper.router().parse_workspace_path(&new_router)?
+        else {
+            return Err(JjError::ReadOnly);
+        };
+        if old_key != new_key {
+            return Err(JjError::CrossDevice);
+        }
+        let (overlay, backend, base_hex, _) = self
+            .mapper
+            .router()
+            .resolve_mutable_workspace(&old_router)
+            .await?;
+        overlay
+            .rename(&backend, &base_hex, &old_rel, &new_rel)
+            .await
+    }
+}
+
 fn split_clean_segments(path: &Path) -> Result<Vec<String>, JjError> {
     let mut out = Vec::new();
     for comp in path.components() {
@@ -718,7 +954,7 @@ mod tests {
         let paths = InstancePaths::resolve(Some("ns-unit"), Some(state_tmp.path()));
         paths.ensure_dirs().unwrap();
         let cas = Arc::new(BlobCas::new(&paths.cache_dir, 0).unwrap());
-        let registry = Arc::new(SourceRegistry::load(paths, cas).unwrap());
+        let registry = Arc::new(SourceRegistry::load(paths.clone(), cas).unwrap());
 
         let repo_name = ws_tmp
             .path()
@@ -745,7 +981,8 @@ mod tests {
             )
             .unwrap();
 
-        let router = Arc::new(NamespaceRouter::new(registry));
+        let overlays = Arc::new(OverlayManager::new(paths.state_dir.join("overlays")).unwrap());
+        let router = Arc::new(NamespaceRouter::new(registry, overlays));
 
         // 1. Change ID reverse-hex symlink -> ../commits/<full_hex>
         // (`setup_test_repo` uses `0000...abcd`, sharing its first 28 zero hex
@@ -800,5 +1037,41 @@ mod tests {
         router.canonicalize_mount_scope(&mut alias_scope);
         let dir_scope = MountScope::parse(Some(&format!("local:{repo_name}/default"))).unwrap();
         assert_eq!(alias_scope, dir_scope);
+
+        let vfs_alias = RouterVfs::new(SubtreePathMapper::new(
+            Arc::clone(&router),
+            alias_scope.clone(),
+            alias_scope.router_prefix(Some("local")),
+        ));
+        let vfs_dir = RouterVfs::new(SubtreePathMapper::new(
+            Arc::clone(&router),
+            dir_scope.clone(),
+            dir_scope.router_prefix(Some("local")),
+        ));
+
+        vfs_alias
+            .create_file(Path::new("shared.txt"), false, true)
+            .await
+            .unwrap();
+        vfs_alias
+            .write(Path::new("shared.txt"), 0, b"one-overlay")
+            .await
+            .unwrap();
+        assert_eq!(
+            &*vfs_dir.read(Path::new("shared.txt"), 0, 32).await.unwrap(),
+            b"one-overlay"
+        );
+        assert_eq!(router.overlays().active_overlays().len(), 1);
+
+        // `.jj` inside `local-jj` workspace is readable, but any write returns
+        // `ReadOnly` (EROFS)
+        let jj_attr = vfs_dir.get_attributes(Path::new(".jj")).await.unwrap();
+        assert_eq!(jj_attr.file_type, FileType::Directory);
+        assert!(matches!(
+            vfs_dir
+                .create_file(Path::new(".jj/working_copy/lock"), false, false)
+                .await,
+            Err(JjError::ReadOnly)
+        ));
     }
 }

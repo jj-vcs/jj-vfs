@@ -39,10 +39,11 @@ use crate::inode_map::InodeMap;
 use crate::ipc_server::ControlHandler;
 use crate::jj_error::JjError;
 use crate::namespace::NamespaceRouter;
+use crate::namespace::RouterVfs;
 use crate::namespace::SubtreePathMapper;
+use crate::overlay::OverlayManager;
 use crate::registry::SourceRegistry;
 use crate::registry::expand_tilde;
-use crate::vfs::PathMappedVfs;
 
 struct ActiveMountEntry {
     info: ActiveMountInfo,
@@ -65,6 +66,7 @@ impl Drop for MountReservation<'_> {
 
 pub struct DaemonRuntime {
     registry: Arc<SourceRegistry>,
+    overlays: Arc<OverlayManager>,
     router: Arc<NamespaceRouter>,
     mounts: Mutex<BTreeMap<PathBuf, ActiveMountEntry>>,
     mounting: Mutex<BTreeSet<PathBuf>>,
@@ -74,10 +76,15 @@ impl DaemonRuntime {
     pub fn new(paths: InstancePaths) -> Result<Arc<Self>, JjError> {
         paths.ensure_dirs()?;
         let cas = Arc::new(BlobCas::new(&paths.cache_dir, DEFAULT_MAX_CACHE_BYTES)?);
+        let overlays = Arc::new(OverlayManager::new(paths.state_dir.join("overlays"))?);
         let registry = Arc::new(SourceRegistry::load(paths, cas)?);
-        let router = Arc::new(NamespaceRouter::new(Arc::clone(&registry)));
+        let router = Arc::new(NamespaceRouter::new(
+            Arc::clone(&registry),
+            Arc::clone(&overlays),
+        ));
         Ok(Arc::new(Self {
             registry,
+            overlays,
             router,
             mounts: Mutex::new(BTreeMap::new()),
             mounting: Mutex::new(BTreeSet::new()),
@@ -86,6 +93,10 @@ impl DaemonRuntime {
 
     pub fn registry(&self) -> &Arc<SourceRegistry> {
         &self.registry
+    }
+
+    pub fn overlays(&self) -> &Arc<OverlayManager> {
+        &self.overlays
     }
 
     pub fn router(&self) -> &Arc<NamespaceRouter> {
@@ -168,7 +179,7 @@ impl DaemonRuntime {
             scope.clone(),
             router_prefix.clone(),
         );
-        let vfs = Arc::new(PathMappedVfs::new(mapper));
+        let vfs = Arc::new(RouterVfs::new(mapper));
         let inode_map = Arc::new(InodeMap::new());
         let fuse = JjFuse::with_inode_map(
             vfs,
@@ -306,7 +317,7 @@ impl ControlHandler for DaemonRuntime {
             }
             ControlRequest::RemoveSource { alias, force } => {
                 match self.registry.remove_source(&alias, force, |src| {
-                    self.is_source_mounted(src) || self.registry.has_active_repo(src)
+                    self.is_source_mounted(src) || self.overlays.has_dirty_for_source(src)
                 }) {
                     Ok(()) => ControlResponse::Ok {
                         message: format!("removed source '{alias}'"),
@@ -710,5 +721,196 @@ mod tests {
         assert_eq!(runtime.active_mounts().len(), 2);
         runtime.unmount_all().await;
         assert!(runtime.active_mounts().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn fuse_read_write_overlay_enforces_gitignore_erofs_and_exdev() {
+        if !fuse_available() {
+            eprintln!("skipping FUSE test: /dev/fuse unavailable");
+            return;
+        }
+        let (ws_a, _repo_a, cid_a) = setup_test_repo().await;
+        let (ws_b, _repo_b, _cid_b) = setup_test_repo().await;
+
+        let state_dir = tempfile::tempdir().unwrap();
+        let paths = InstancePaths::resolve(Some("rw-mnt"), Some(state_dir.path()));
+        let runtime = DaemonRuntime::new(paths).unwrap();
+
+        let repo_a_name = ws_a
+            .path()
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        let repo_b_name = ws_b
+            .path()
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        for (alias, p) in [("srca", ws_a.path()), ("srcb", ws_b.path())] {
+            runtime
+                .registry()
+                .add_source(
+                    alias.into(),
+                    SourceConfig {
+                        kind: SourceKind::LocalJj,
+                        url: None,
+                        daemon_socket: None,
+                        user: None,
+                        auth_token_env: None,
+                        auth_token_cmd: vec![],
+                        path: Some(p.to_path_buf()),
+                        search_paths: vec![],
+                        repos: BTreeMap::new(),
+                        ephemeral: true,
+                    },
+                )
+                .unwrap();
+        }
+
+        let root_mnt = tempfile::tempdir().unwrap();
+        let ws_mnt = tempfile::tempdir().unwrap();
+        runtime
+            .mount_target(None, root_mnt.path().to_path_buf(), false)
+            .await
+            .unwrap();
+        runtime
+            .mount_target(
+                Some(format!("srca:{repo_a_name}/default")),
+                ws_mnt.path().to_path_buf(),
+                false,
+            )
+            .await
+            .unwrap();
+
+        for _ in 0..30 {
+            if ws_mnt.path().join("file1.txt").exists() && root_mnt.path().join("srca").exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        }
+
+        // 1. Write `.gitignore` and ignored `target/artifact.o` + tracked
+        //    `src/main.rs` via real POSIX syscalls!
+        std::fs::write(ws_mnt.path().join(".gitignore"), "target/\n").unwrap();
+        std::fs::create_dir(ws_mnt.path().join("target")).unwrap();
+        std::fs::write(ws_mnt.path().join("target/artifact.o"), b"BINARY_OBJ").unwrap();
+        assert_eq!(
+            std::fs::read(ws_mnt.path().join("target/artifact.o")).unwrap(),
+            b"BINARY_OBJ"
+        );
+
+        std::fs::create_dir(ws_mnt.path().join("src")).unwrap();
+        std::fs::write(ws_mnt.path().join("src/main.rs"), "fn main() {}\n").unwrap();
+        std::fs::rename(
+            ws_mnt.path().join("src/main.rs"),
+            ws_mnt.path().join("src/lib.rs"),
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(ws_mnt.path().join("src/lib.rs")).unwrap(),
+            "fn main() {}\n"
+        );
+        assert!(!ws_mnt.path().join("src/main.rs").exists());
+
+        // Modify + unlink existing base-commit files
+        std::fs::write(ws_mnt.path().join("file1.txt"), "rewritten via fuse").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(ws_mnt.path().join("file1.txt")).unwrap(),
+            "rewritten via fuse"
+        );
+        std::fs::remove_file(ws_mnt.path().join("dir/file2.txt")).unwrap();
+        assert!(!ws_mnt.path().join("dir/file2.txt").exists());
+        std::fs::remove_dir(ws_mnt.path().join("dir")).unwrap();
+        assert!(!ws_mnt.path().join("dir").exists());
+
+        // Verify Root Mount simultaneously sees the exact same
+        // WorkspaceOverlay!
+        let root_ws_a = root_mnt
+            .path()
+            .join("srca/repos")
+            .join(&repo_a_name)
+            .join("users/local/default");
+        assert_eq!(
+            std::fs::read_to_string(root_ws_a.join("src/lib.rs")).unwrap(),
+            "fn main() {}\n"
+        );
+
+        // 2. Writing inside immutable `commits/<id>/...` returns `EROFS`!
+        let ro_commit_file = root_mnt
+            .path()
+            .join("srca/repos")
+            .join(&repo_a_name)
+            .join("commits")
+            .join(cid_a.hex())
+            .join("file1.txt");
+        let ro_err = std::fs::write(&ro_commit_file, "mutate immutable").unwrap_err();
+        assert_eq!(ro_err.raw_os_error(), Some(libc::EROFS));
+
+        // 3. Cross-workspace rename inside Root Mount returns `EXDEV`!
+        let root_ws_b = root_mnt
+            .path()
+            .join("srcb/repos")
+            .join(&repo_b_name)
+            .join("users/local/default");
+        let xdev_err =
+            std::fs::rename(root_ws_a.join("src/lib.rs"), root_ws_b.join("moved.rs")).unwrap_err();
+        assert_eq!(xdev_err.raw_os_error(), Some(libc::EXDEV));
+
+        // 4. chmod on tracked (`root_ws_b/dir`) and newly-created
+        //    (`ws_mnt/src`) directories succeeds, staged directory rename
+        //    (`src` -> `src_moved`) works, base-tree directory rename returns
+        //    `EXDEV`, `RENAME_EXCHANGE` returns `EINVAL`, and `.jj` in local-jj
+        //    is read-only (`EROFS`)!
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(
+            ws_mnt.path().join("src"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            root_ws_b.join("dir"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+
+        std::fs::rename(ws_mnt.path().join("src"), ws_mnt.path().join("src_moved")).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(ws_mnt.path().join("src_moved/lib.rs")).unwrap(),
+            "fn main() {}\n"
+        );
+        let base_dir_rename =
+            std::fs::rename(root_ws_b.join("dir"), root_ws_b.join("dir_moved")).unwrap_err();
+        assert_eq!(base_dir_rename.raw_os_error(), Some(libc::EXDEV));
+
+        let c_a =
+            std::ffi::CString::new(ws_mnt.path().join("file1.txt").to_str().unwrap()).unwrap();
+        let c_b = std::ffi::CString::new(ws_mnt.path().join("src_moved/lib.rs").to_str().unwrap())
+            .unwrap();
+        // SAFETY: valid NUL-terminated paths passed to libc::renameat2.
+        let rc = unsafe {
+            libc::renameat2(
+                libc::AT_FDCWD,
+                c_a.as_ptr(),
+                libc::AT_FDCWD,
+                c_b.as_ptr(),
+                libc::RENAME_EXCHANGE,
+            )
+        };
+        assert_eq!(rc, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EINVAL)
+        );
+
+        let jj_ro_err =
+            std::fs::write(ws_mnt.path().join(".jj/working_copy/lock"), "nope").unwrap_err();
+        assert_eq!(jj_ro_err.raw_os_error(), Some(libc::EROFS));
+
+        runtime.unmount_all().await;
     }
 }

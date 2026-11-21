@@ -86,6 +86,7 @@ fn main() -> anyhow::Result<()> {
     let _instance_lock = acquire_instance_lock(&paths.state_dir)?;
 
     let runtime = DaemonRuntime::new(paths.clone())?;
+    rt.block_on(runtime.mount_configured());
     let shutdown = Arc::new(Notify::new());
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let sd_sig = Arc::clone(&shutdown);
@@ -101,13 +102,15 @@ fn main() -> anyhow::Result<()> {
         socket = %paths.socket_path.display(),
         "jjfsd listening on control socket"
     );
-    rt.block_on(serve_control_socket_with_watch(
+    let res = rt.block_on(serve_control_socket_with_watch(
         &paths.socket_path,
-        runtime,
+        Arc::clone(&runtime),
         shutdown,
         shutdown_tx,
         shutdown_rx,
-    ))?;
+    ));
+    rt.block_on(runtime.unmount_all());
+    res?;
     Ok(())
 }
 

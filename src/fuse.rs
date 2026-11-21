@@ -72,11 +72,23 @@ pub struct JjFuse<FS: VirtualFilesystem> {
 
 impl<FS: VirtualFilesystem> JjFuse<FS> {
     pub fn new(fs: Arc<FS>, rt_handle: tokio::runtime::Handle) -> Self {
+        Self::with_inode_map(fs, Arc::new(InodeMap::new()), rt_handle)
+    }
+
+    pub fn with_inode_map(
+        fs: Arc<FS>,
+        inode_map: Arc<InodeMap>,
+        rt_handle: tokio::runtime::Handle,
+    ) -> Self {
         Self {
             fs,
-            inode_map: Arc::new(InodeMap::new()),
+            inode_map,
             rt_handle,
         }
+    }
+
+    pub fn inode_map(&self) -> &Arc<InodeMap> {
+        &self.inode_map
     }
 }
 
@@ -206,11 +218,12 @@ impl<FS: VirtualFilesystem + Send + Sync + 'static> Filesystem for JjFuse<FS> {
 
 impl FileAttributes {
     pub fn to_fuse(&self, ino: INodeNo) -> FileAttr {
+        let caller = vfs_proto::CallerContext::current_process();
         FileAttr {
             ino,
             size: self.size,
             blocks: self.size.div_ceil(512),
-            atime: SystemTime::now(), // TODO: properly set timestamps
+            atime: SystemTime::now(),
             mtime: self.modified,
             ctime: self.modified,
             crtime: self.created,
@@ -230,8 +243,8 @@ impl FileAttributes {
                 crate::virtual_file::FileType::Directory => 2,
                 _ => 1,
             },
-            uid: 1000,
-            gid: 1000,
+            uid: caller.uid,
+            gid: caller.gid,
             rdev: 0,
             flags: 0,
             blksize: 4096,

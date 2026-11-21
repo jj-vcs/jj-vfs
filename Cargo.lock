@@ -3016,6 +3016,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "ustr",
+ "vfs-proto",
 ]
 
 [[package]]

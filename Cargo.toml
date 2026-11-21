@@ -89,6 +89,7 @@ tower.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 ustr.workspace = true
+vfs-proto = { path = "crates/vfs-proto" }
 
 [dev-dependencies]
 jjfsd = { path = ".", features = ["test-helpers"] }

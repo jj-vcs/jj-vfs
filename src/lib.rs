@@ -43,6 +43,7 @@ pub mod inode_map;
 pub mod jj_error;
 pub mod path_mapper;
 pub mod path_mapper_all_commits;
+pub mod registry;
 pub mod static_directory;
 #[cfg(any(test, feature = "test-helpers"))]
 pub mod test_helpers;

@@ -142,7 +142,7 @@ Option C organizes every `<source>` under two top-level directories (`repos/` an
     └── users/
         └── <user>/
             └── <repo>/
-                └── <workspace> -> ../../../../repos/<repo>/users/<user>/<workspace>
+                └── <workspace> -> ../../../repos/<repo>/users/<user>/<workspace>
 ```
 
 Two rules keep this namespace fast and alias-free:
@@ -291,7 +291,7 @@ sequenceDiagram
 | Scope Tier | Capabilities Included | Rationale |
 | :-- | :-- | :-- |
 | **In First MVP** | Multi-source registry (`commit-cloud`, `local-jj`, `local-git`, `local-dir`), per-user jjfsd + `--instance`, Root + Scoped Direct Mounts, metadata-only `getattr`, ranged `ReadFile`, local disk CAS, durable `WorkspaceOverlay` + `.gitignore` split, $2\text{ s}$ debounced snapshots, synthesized `.jj/` + $O(k)$ `VfsWorkingCopy`, targeted kernel cache invalidation, and $50$-workspace `xtask` benchmark | Delivers full Linux cloud-jj M1/M2 workspace lifecycle across Commit Cloud and local repos with 1:1 Git SHA-1 fidelity |
-| **Deferred Post-MVP** | macOS ([Fuse-T](https://www.fuse-t.org/) / FSKit) and Windows ([ProjFS](https://learn.microsoft.com/en-us/windows/win32/projfs/projected-file-system)) drivers, content-defined chunking for $1\text{ TB}$ sparse mid-file edits, full offline rebase queueing, root multi-user Kubernetes node daemonset, and cross-machine ignored-file VFS server | Isolates OS-specific drivers and storage-format changes behind trait seams and benchmark gates |
+| **Deferred Post-MVP** | macOS ([FSKit](https://developer.apple.com/documentation/fskit) and [macFUSE](https://macfuse.github.io/)) and Windows ([ProjFS](https://learn.microsoft.com/en-us/windows/win32/projfs/projected-file-system)) drivers, content-defined chunking for $1\text{ TB}$ sparse mid-file edits, full offline rebase queueing, root multi-user Kubernetes node daemonset, and cross-machine ignored-file VFS server | Isolates OS-specific drivers and storage-format changes behind trait seams and benchmark gates |
 
 Implementation proceeds as an 11-commit linear stack in jj-vfs (beginning with repository documentation guidelines in [AGENTS.md](../AGENTS.md)), where unit tests run without external services and FUSE mount and CLI e2e tests run when `/dev/fuse` and jj-cc-server are available:
 
@@ -309,6 +309,6 @@ Implementation proceeds as an 11-commit linear stack in jj-vfs (beginning with r
 
 ## Vision and Future Directions
 
-* **macOS and Windows Endpoints:** Because `JjFuse` sits above `VirtualFilesystem`, `NamespaceRouter`, and `WorkspaceOverlay`, future milestones can attach a kext-free macOS driver (evaluating local NFSv4 via Fuse-T and Apple FSKit) and a Windows Projected File System (ProjFS) adapter without rewriting source routing, caching, or Commit Cloud synchronization.
+* **macOS and Windows Endpoints:** Because `JjFuse` sits above `VirtualFilesystem`, `NamespaceRouter`, and `WorkspaceOverlay`, future milestones can attach a macOS driver via Apple FSKit and macFUSE and a Windows Projected File System (ProjFS) adapter without rewriting source routing, caching, or Commit Cloud synchronization.
 * **Node-Level Kubernetes Daemonsets:** Extending `CallerContext` to inspect FUSE request `uid` and `gid` headers and map container mount namespaces to per-sandbox credentials enables a single node-level jjfsd daemonset to provision workspaces for hundreds of ephemeral agent pods per node.
 * **Content-Defined Chunking and Live Ignored-File Sync:** If partner benchmarks on $> 5\text{ GiB}$ mutable binary assets show whole-blob background uploads saturating uplink bandwidth, content-defined chunking can layer beneath `BlobStore` as an internal transfer representation while preserving external Git blob hashes, followed by an optional jj-vfs-server for roaming ignored build caches across machines.

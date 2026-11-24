@@ -5,3 +5,8 @@
 .vscode
 .zed
 
+
+# Nix and direnv
+.envrc
+.direnv/
+/result

@@ -4,12 +4,12 @@
 
 Decouples POSIX filesystem dispatch from how directories, files, and symlinks store metadata and bytes.
 
-Includes persistance hooks that can be treated as optional.
+Includes persistence hooks that can be treated as optional.
 
 ### DirectoryBackend
 
 Defines all operations on a single directory node:
-- **Membership & lookup**: `is_empty`, `lookup`, `find_name_by_inode`, `get_children_count` (excluding `.` and `..`), `add_child`, `remove_child`. Note that `add_child` and `remove_child` do not update the child's `parents` list; callers (such as `CartFs` under `locking.rs` guards) own parent-link consistency.
+- **Membership & lookup**: `is_empty`, `lookup`, `find_name_by_inode`, `get_children_count` (excluding `.` and `..`), `add_child`, `remove_child`. Note that `add_child` and `remove_child` do not update the child's `parents` list; callers (such as vfs_core) own parent-link consistency.
 - **Directory enumeration**: `opendir` (returns `OpendirResult` with `directory_handle` and `can_cache`), `readdir` (invokes `ReaddirCallback` with `(INodeNo, offset, FileType, &OsStr)`), and `releasedir`.
 - **Entry creation**: `mknod`, `mkdir`, `symlink`, and `register_file` (defaulting to `ENOTSUP`/unimplemented; used for pre-registering CAS-backed files with digest, size, and pull urgency).
 - **Attributes, digests & persistence**: `getattr`, `setattr`, `get_digest` (SHA-256 of entries), `to_persisted_backend`, and `get_persisted_metadata`.
@@ -87,7 +87,7 @@ flowchart TB
   - `Directory { backend: Box<dyn DirectoryBackend> }`
   - `File { backend: Box<dyn FileBackend>, open_count: u32, passthrough_data: Option<PassthroughData> }`
   - `Symlink { backend: Box<dyn SymlinkBackend> }`
-- **Passthrough state (`PassthroughData`)**: Holds `backing_id: fuser::BackingId` and `native_handle: fuser::FileHandle`. On first open when passthrough is enabled, `CartFs` calls `reply.open_backing(fd)` and caches `PassthroughData` on the inode; subsequent opens reuse it while incrementing `open_count`. When `open_count` drops to `0` on `release`, `passthrough_data` is set to `None` (dropping `BackingId` to close the kernel backing file) and `backend.release` is called.
+- **Passthrough state (`PassthroughData`)**: Holds `backing_id: fuser::BackingId` and `native_handle: fuser::FileHandle`. On first open when passthrough is enabled, vfs_core calls `reply.open_backing(fd)` and caches `PassthroughData` on the inode; subsequent opens reuse it while incrementing `open_count`. When `open_count` drops to `0` on `release`, `passthrough_data` is set to `None` (dropping `BackingId` to close the kernel backing file) and `backend.release` is called.
 - **Persistence**: `restore`, `to_persisted`, and `to_persisted_with_attr_and_backend` serialize/deserialize `PersistedInode` protos.
 
 ### InodeStore
@@ -147,7 +147,7 @@ A generic lazy-loading wrapper `HydratingDirectoryBackend<NotHydrated, Hydrated,
 - **Three-state machine (`HydratingState`)**:
   - `NotHydrated(NotHydrated)`: Holds lightweight configuration data before first directory access. `getattr` returns `not_hydrated_attr` without triggering hydration, keeping `stat` storms cheap. `releasedir` is a no-op.
   - `Hydrated(Hydrated)`: Holds the materialized `DirectoryBackend` and forwards all calls directly.
-  - `Error(CartFsError)`: Caches hydration failure so subsequent calls fail deterministically without retrying a broken hydrator.
+  - `Error`: Caches hydration failure so subsequent calls fail deterministically without retrying a broken hydrator.
 - **Async transition (`ensure_hydrated`)**: On the first operation requiring directory contents (`lookup`, `opendir`, `readdir`, `is_empty`, `mknod`, `mkdir`, `symlink`, `setattr`, etc.), replaces `NotHydrated` with a temporary `Error("Hydration interrupted")` guard, consumes `hydrator: Option<Hydrator>`, and executes `context.block_on(hydrator(context, state))` to transition to `Hydrated` or `Error`.
 - **Pre-hydration persistence**: `with_persistence` accepts a function pointer `fn(&NotHydrated) -> Option<persisted_inode::Backend>`, allowing unhydrated directories to be persisted and restored across daemon restarts without forcing eager hydration.
 

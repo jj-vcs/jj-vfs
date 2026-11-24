@@ -4,6 +4,8 @@
 
 Decouples POSIX filesystem dispatch from how directories, files, and symlinks store metadata and bytes.
 
+Includes persistance hooks that can be treated as optional.
+
 ### DirectoryBackend
 
 Defines all operations on a single directory node:
@@ -30,9 +32,9 @@ Minimal trait for symbolic links:
 ```mermaid
 flowchart TB
   subgraph Layer5["5. FUSE Entry & Filesystem Orchestration"]
-    Fuser["FuserAdapter<br/>(fuser_adapter.rs)"]
-    FsTrait["Filesystem trait<br/>(filesystem.rs)"]
-    CoreFs["CartFs / CoreFs<br/>(cartfs.rs, cartfs_filesystem.rs)"]
+    Fuser["FuserAdapter"]
+    FsTrait["Filesystem"]
+    CoreFs["vfs_core"]
   end
 
   subgraph Layer4["4. Reusable Directory Implementations"]
@@ -163,10 +165,10 @@ Internal `Send + Sync` filesystem trait decoupled from `fuser::Request` and `Rep
 - **Core POSIX surface**: `init`, `lookup`, `getattr`, `statfs`, `setattr`, `mknod`, `mkdir`, `symlink`, `unlink`, `rmdir`, `rename`, `link`, `open` (takes `ReplyOpen` for `open_backing` passthrough setup), `read`, `write`, `release`, `opendir`, `readdir`, `releasedir`, `readlink`, `fallocate`, `fsync`, and `fsyncdir`.
 - **Kernel notifications & helpers**: `notifier`, `notify_inval_entry`, `notify_inval_inode`, `rt`, and `create_context`.
 
-### JJFilesystem
+### vfs_core
 
-The concrete `Filesystem` implementation that wires together the lower VFS layers:
-- **Core VFS mechanics (kept in `core_vfs` as `CoreFs`)**:
+The concrete Filesystem implementation that wires together the lower VFS layers:
+- **Core VFS mechanics**:
   - Owns `InodeStore`, `LogicalFileHandles`, `next_directory_handle_id`, `passthrough_enabled`, `dir_path_to_ino_cache`, and `notifier`.
   - Dispatches `rename` across `LockedRenameTopology` cases via `lock_for_rename` (with `RENAME_EXCHANGE` and `RENAME_NOREPLACE` support), `link` via `lock_for_link`, and `unlink`/`rmdir` via `lock_for_remove_entry`.
   - Manages `FUSE_PASSTHROUGH` (`reply.open_backing`, `PassthroughData`, `open_count`, and `LogicalFileHandles` multiplexing).

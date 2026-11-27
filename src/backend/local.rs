@@ -55,19 +55,23 @@ use jj_lib::backend::TreeValue;
 use jj_lib::config::ConfigLayer;
 use jj_lib::config::ConfigSource;
 use jj_lib::config::StackedConfig;
+use jj_lib::default_backend_factories::default_backend_factories;
+use jj_lib::default_backend_factories::default_working_copy_factories;
 use jj_lib::merge::Merge;
 use jj_lib::merged_tree::MergedTree;
 use jj_lib::object_id::HexPrefix;
 use jj_lib::object_id::ObjectId as _;
 use jj_lib::object_id::PrefixResolution;
+use jj_lib::ref_name::WorkspaceName;
 use jj_lib::repo::ReadonlyRepo;
 use jj_lib::repo::Repo as _;
 use jj_lib::repo::RepoLoader;
-use jj_lib::repo::StoreFactories;
 use jj_lib::repo_path::RepoPathBuf;
 use jj_lib::settings::UserSettings;
+use jj_lib::tree::TreeMergeExt as _;
+use jj_lib::workspace::DefaultWorkspaceLoaderFactory;
 use jj_lib::workspace::Workspace;
-use jj_lib::workspace::default_working_copy_factories;
+use jj_lib::workspace::WorkspaceLoaderFactory as _;
 use parking_lot::Mutex;
 use parking_lot::RwLock;
 
@@ -352,25 +356,28 @@ fn default_local_settings() -> Result<UserSettings, JjError> {
     let layer = ConfigLayer::parse(ConfigSource::User, cfg_text)
         .map_err(|e| std::io::Error::other(format!("config parse error: {e}")))?;
     config.add_layer(layer);
-    UserSettings::from_config(config)
+    UserSettings::from_config_and_home_dir(config, None)
         .map_err(|e| std::io::Error::other(format!("settings error: {e}")).into())
 }
 
 fn load_repo_loader(workspace_root: &Path) -> Result<RepoLoader, JjError> {
     let settings = default_local_settings()?;
-    let ws = Workspace::load(
-        &settings,
-        workspace_root,
-        &StoreFactories::default(),
-        &default_working_copy_factories(),
-    )
-    .map_err(|e| std::io::Error::other(format!("failed to load jj workspace: {e:?}")))?;
+    let ws = DefaultWorkspaceLoaderFactory
+        .create(workspace_root)
+        .and_then(|loader| {
+            loader.load(
+                &settings,
+                &default_backend_factories(),
+                &default_working_copy_factories(),
+            )
+        })
+        .map_err(|e| std::io::Error::other(format!("failed to load jj workspace: {e:?}")))?;
     Ok(ws.repo_loader().clone())
 }
 
 async fn load_repo_at_head(loader: &RepoLoader) -> Result<Arc<ReadonlyRepo>, JjError> {
     loader
-        .load_at_head()
+        .load_at_head(None)
         .await
         .map_err(|e| std::io::Error::other(format!("failed to load repo at head: {e:?}")).into())
 }
@@ -406,9 +413,14 @@ async fn sync_git_mirror(
         None => {
             std::fs::create_dir_all(mirror_dir)?;
             let settings = default_local_settings()?;
-            let (ws, repo) = Workspace::init_external_git(&settings, mirror_dir, git_dir)
-                .await
-                .map_err(|e| std::io::Error::other(format!("init_external_git failed: {e:?}")))?;
+            let (ws, repo) = Workspace::init_external_git(
+                &settings,
+                mirror_dir,
+                WorkspaceName::DEFAULT,
+                git_dir,
+            )
+            .await
+            .map_err(|e| std::io::Error::other(format!("init_external_git failed: {e:?}")))?;
             (ws.repo_loader().clone(), repo, true)
         }
     };
@@ -532,7 +544,7 @@ fn seed_pinned_from_repo(repo: &ReadonlyRepo, pinned: &DashSet<String>) {
         pinned.insert(wc_id.hex());
     }
     for (_, target) in repo.view().local_bookmarks() {
-        for add in target.added_ids() {
+        for add in target.present_adds() {
             pinned.insert(add.hex());
         }
     }
@@ -575,6 +587,7 @@ impl ReadOnlyVfsBackend for LocalRepoVfsBackend {
         match repo
             .index()
             .resolve_commit_id_prefix(&prefix)
+            .await
             .map_err(|e| std::io::Error::other(format!("resolve_commit_id_prefix failed: {e:?}")))?
         {
             PrefixResolution::SingleMatch(id) => {
@@ -595,10 +608,15 @@ impl ReadOnlyVfsBackend for LocalRepoVfsBackend {
         }
         let repo = self.current_repo().await?;
         let prefix = HexPrefix::try_from_hex(&hex_str).ok_or(JjError::NotFound)?;
-        let resolved = match repo
-            .resolve_change_id_prefix(&prefix)
-            .map_err(|e| std::io::Error::other(format!("resolve_change_id_prefix: {e:?}")))?
-        {
+        let resolved = run_blocking(move || {
+            futures::executor::block_on(async move {
+                repo.resolve_change_id_prefix(&prefix).await.map_err(|e| {
+                    std::io::Error::other(format!("resolve_change_id_prefix: {e:?}")).into()
+                })
+            })
+        })
+        .await?;
+        let resolved = match resolved {
             PrefixResolution::SingleMatch(targets) => targets,
             PrefixResolution::NoMatch => return Err(JjError::NotFound),
             PrefixResolution::AmbiguousMatch => return Ok(None),
@@ -624,7 +642,7 @@ impl ReadOnlyVfsBackend for LocalRepoVfsBackend {
         for (name, target) in repo.view().local_bookmarks() {
             if let Some(Some(commit_id)) = target.as_resolved() {
                 out.insert(name.as_str().to_string(), commit_id.hex());
-            } else if let Some(first) = target.added_ids().next() {
+            } else if let Some(first) = target.present_adds().next() {
                 out.insert(name.as_str().to_string(), first.hex());
             }
         }
@@ -910,7 +928,7 @@ impl ReadOnlyVfsBackend for LocalRepoVfsBackend {
         let new_tree = MergedTree::resolved(repo.store().clone(), new_tid);
         let mut changed = Vec::new();
         use futures::StreamExt as _;
-        let mut stream = old_tree.diff_stream(&new_tree, &jj_lib::matchers::EverythingMatcher);
+        let mut stream = old_tree.diff(&new_tree, &jj_lib::matchers::EverythingMatcher);
         while let Some(entry) = stream.next().await {
             changed.push(entry.path.as_internal_file_string().to_string());
         }
@@ -954,34 +972,38 @@ mod tests {
         let cas_dir = tempfile::tempdir().unwrap();
         let cas = Arc::new(BlobCas::new(cas_dir.path(), 10 * 1024 * 1024).unwrap());
 
-        let (ws, repo) = Workspace::init_internal_git(&settings, ws_dir.path())
-            .await
-            .unwrap();
+        let (ws, repo) = Workspace::init_internal_git(
+            &settings,
+            ws_dir.path(),
+            WorkspaceName::DEFAULT,
+            gix::hash::Kind::Sha1,
+        )
+        .await
+        .unwrap();
         let store = repo.store().clone();
-        let mut tb =
-            jj_lib::tree_builder::TreeBuilder::new(store.clone(), store.empty_tree_id().clone());
+        let mut tb = jj_lib::merged_tree_builder::MergedTreeBuilder::new(MergedTree::resolved(
+            store.clone(),
+            store.empty_tree_id().clone(),
+        ));
         let script_path = RepoPathBuf::from_relative_path(Path::new("bin/run.sh")).unwrap();
         let payload = b"#!/bin/sh\necho hello_jj_vfs_ranged_read\n";
         let fid = store
             .write_file(&script_path, &mut &payload[..])
             .await
             .unwrap();
-        tb.set(
+        tb.set_or_remove(
             script_path,
-            TreeValue::File {
+            Some(TreeValue::File {
                 id: fid,
                 executable: true,
                 copy_id: jj_lib::backend::CopyId::placeholder(),
-            },
+            }),
         );
-        let tid = tb.write_tree().await.unwrap();
+        let tree = tb.write_tree().await.unwrap();
         let mut tx = repo.start_transaction();
         let commit = tx
             .repo_mut()
-            .new_commit(
-                vec![store.root_commit_id().clone()],
-                MergedTree::resolved(store.clone(), tid),
-            )
+            .new_commit(vec![store.root_commit_id().clone()], tree)
             .set_description("add executable script")
             .write()
             .await
@@ -1066,12 +1088,19 @@ mod tests {
         // so inserting B evicts A from CAS.
         let cas = Arc::new(BlobCas::new(cas_dir.path(), 20).unwrap());
 
-        let (ws, repo) = Workspace::init_internal_git(&settings, ws_dir.path())
-            .await
-            .unwrap();
+        let (ws, repo) = Workspace::init_internal_git(
+            &settings,
+            ws_dir.path(),
+            WorkspaceName::DEFAULT,
+            gix::hash::Kind::Sha1,
+        )
+        .await
+        .unwrap();
         let store = repo.store().clone();
-        let mut tb =
-            jj_lib::tree_builder::TreeBuilder::new(store.clone(), store.empty_tree_id().clone());
+        let mut tb = jj_lib::merged_tree_builder::MergedTreeBuilder::new(MergedTree::resolved(
+            store.clone(),
+            store.empty_tree_id().clone(),
+        ));
         let path_a = RepoPathBuf::from_relative_path(Path::new("a.txt")).unwrap();
         let path_b = RepoPathBuf::from_relative_path(Path::new("b.txt")).unwrap();
         let fid_a = store
@@ -1082,30 +1111,27 @@ mod tests {
             .write_file(&path_b, &mut &b"fedcba9876543210"[..])
             .await
             .unwrap();
-        tb.set(
+        tb.set_or_remove(
             path_a,
-            TreeValue::File {
+            Some(TreeValue::File {
                 id: fid_a,
                 executable: false,
                 copy_id: jj_lib::backend::CopyId::placeholder(),
-            },
+            }),
         );
-        tb.set(
+        tb.set_or_remove(
             path_b,
-            TreeValue::File {
+            Some(TreeValue::File {
                 id: fid_b,
                 executable: false,
                 copy_id: jj_lib::backend::CopyId::placeholder(),
-            },
+            }),
         );
-        let tid = tb.write_tree().await.unwrap();
+        let tree = tb.write_tree().await.unwrap();
         let mut tx = repo.start_transaction();
         let c1 = tx
             .repo_mut()
-            .new_commit(
-                vec![store.root_commit_id().clone()],
-                MergedTree::resolved(store.clone(), tid),
-            )
+            .new_commit(vec![store.root_commit_id().clone()], tree)
             .write()
             .await
             .unwrap();

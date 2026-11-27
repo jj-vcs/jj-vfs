@@ -26,6 +26,7 @@ use jj_lib::merge::Merge;
 use jj_lib::repo::ReadonlyRepo;
 use jj_lib::repo::Repo;
 use jj_lib::repo_path::RepoPathBuf;
+use jj_lib::tree::TreeMergeExt as _;
 
 use crate::jj_error::JjError;
 use crate::virtual_file::DirectoryEntry;

@@ -23,10 +23,11 @@ use std::sync::Arc;
 
 use clap::Parser;
 use jj_lib::config::StackedConfig;
-use jj_lib::repo::StoreFactories;
+use jj_lib::default_backend_factories::default_backend_factories;
+use jj_lib::default_backend_factories::default_working_copy_factories;
 use jj_lib::settings::UserSettings;
-use jj_lib::workspace::Workspace;
-use jj_lib::workspace::default_working_copy_factories;
+use jj_lib::workspace::DefaultWorkspaceLoaderFactory;
+use jj_lib::workspace::WorkspaceLoaderFactory as _;
 use jjfsd::daemon::DaemonRuntime;
 use jjfsd::ipc_server::acquire_instance_lock;
 use jjfsd::ipc_server::serve_control_socket_with_watch;
@@ -126,14 +127,13 @@ fn run_legacy_single_mount(
         fuser::MountOption::FSName("jjfs".to_string()),
     ];
 
-    let settings = UserSettings::from_config(StackedConfig::with_defaults())?;
-    let loaded_workspace = Workspace::load(
+    let settings = UserSettings::from_config_and_home_dir(StackedConfig::with_defaults(), None)?;
+    let loaded_workspace = DefaultWorkspaceLoaderFactory.create(workspace_root)?.load(
         &settings,
-        workspace_root,
-        &StoreFactories::default(),
+        &default_backend_factories(),
         &default_working_copy_factories(),
     )?;
-    let readonly_repo = rt.block_on(loaded_workspace.repo_loader().load_at_head())?;
+    let readonly_repo = rt.block_on(loaded_workspace.repo_loader().load_at_head(None))?;
     let mapper = AllCommitsPathMapper::new(readonly_repo);
     let filesystem = PathMappedVfs::new(mapper);
 

@@ -59,17 +59,18 @@ use jj_lib::backend::TreeValue;
 use jj_lib::config::ConfigLayer;
 use jj_lib::config::ConfigSource;
 use jj_lib::config::StackedConfig;
+use jj_lib::default_backend_factories::default_backend_factories;
+use jj_lib::default_backend_factories::default_working_copy_factories;
 use jj_lib::merge::Merge;
 use jj_lib::merged_tree::MergedTree;
+use jj_lib::merged_tree_builder::MergedTreeBuilder;
 use jj_lib::object_id::ObjectId as _;
 use jj_lib::ref_name::WorkspaceNameBuf;
 use jj_lib::repo::Repo as _;
-use jj_lib::repo::StoreFactories;
 use jj_lib::repo_path::RepoPathBuf;
 use jj_lib::settings::UserSettings;
-use jj_lib::tree_builder::TreeBuilder;
-use jj_lib::workspace::Workspace;
-use jj_lib::workspace::default_working_copy_factories;
+use jj_lib::workspace::DefaultWorkspaceLoaderFactory;
+use jj_lib::workspace::WorkspaceLoaderFactory as _;
 use vfs_proto::SnapshotResult;
 use vfs_proto::VfsWorkingCopyStateFile;
 use vfs_proto::WorkspaceKey;
@@ -397,6 +398,7 @@ pub async fn snapshot_workspace_cc(
         commit_predecessors_set: true,
     };
 
+    #[allow(deprecated)]
     let ws_state = ProtoWorkspaceState {
         repo_id: cc_backend.repo_id().to_string(),
         user: key.user.clone(),
@@ -404,8 +406,10 @@ pub async fn snapshot_workspace_cc(
         commit_id: new_cid_bytes,
         operation_id: Vec::new(),
         tree_id: new_tree_bytes.clone(),
-        sparse_patterns: Vec::new(),
+        sparse_patterns: vec![String::new()],
         tree_ids: vec![new_tree_bytes],
+        conflict_labels: Vec::new(),
+        sparse_patterns_set: true,
     };
 
     let new_op_bytes = cc_backend
@@ -492,16 +496,19 @@ async fn snapshot_workspace_local_inner(
 
     let workspace_root = local_jj_dir.parent().ok_or(JjError::InvalidPath)?;
     let settings = default_snapshot_settings()?;
-    let ws = Workspace::load(
-        &settings,
-        workspace_root,
-        &StoreFactories::default(),
-        &default_working_copy_factories(),
-    )
-    .map_err(|e| std::io::Error::other(format!("load local workspace failed: {e:?}")))?;
+    let ws = DefaultWorkspaceLoaderFactory
+        .create(workspace_root)
+        .and_then(|loader| {
+            loader.load(
+                &settings,
+                &default_backend_factories(),
+                &default_working_copy_factories(),
+            )
+        })
+        .map_err(|e| std::io::Error::other(format!("load local workspace failed: {e:?}")))?;
     let repo = ws
         .repo_loader()
-        .load_at_head()
+        .load_at_head(None)
         .await
         .map_err(|e| std::io::Error::other(format!("load repo at head failed: {e:?}")))?;
     let store = repo.store().clone();
@@ -548,14 +555,15 @@ async fn snapshot_workspace_local_inner(
     };
 
     let base_tree_id = TreeId::try_from_hex(&ws_ref.tree_id_hex).ok_or(JjError::InvalidPath)?;
-    let mut builder = TreeBuilder::new(Arc::clone(&store), base_tree_id);
+    let mut builder =
+        MergedTreeBuilder::new(MergedTree::resolved(Arc::clone(&store), base_tree_id));
 
     for (rel_str, state) in &dirty_map {
         let repo_path =
             RepoPathBuf::from_internal_string(rel_str.clone()).map_err(|_| JjError::InvalidPath)?;
         match state {
             DirtyEntryState::Deleted => {
-                builder.remove(repo_path);
+                builder.set_or_remove(repo_path, None);
             }
             DirtyEntryState::File {
                 staged_path,
@@ -563,24 +571,29 @@ async fn snapshot_workspace_local_inner(
             } => {
                 let bytes = std::fs::read(staged_path)?;
                 let fid = store.write_file(&repo_path, &mut &bytes[..]).await?;
-                builder.set(
+                builder.set_or_remove(
                     repo_path,
-                    TreeValue::File {
+                    Some(TreeValue::File {
                         id: fid,
                         executable: *executable,
                         copy_id: CopyId::placeholder(),
-                    },
+                    }),
                 );
             }
             DirtyEntryState::Symlink { target } => {
                 let target_str = target.to_str().ok_or(JjError::InvalidPath)?;
                 let sid = store.write_symlink(&repo_path, target_str).await?;
-                builder.set(repo_path, TreeValue::Symlink(sid));
+                builder.set_or_remove(repo_path, Some(TreeValue::Symlink(sid)));
             }
         }
     }
 
-    let new_tree_id = builder.write_tree().await?;
+    let new_merged_tree = builder.write_tree().await?;
+    let new_tree_id = new_merged_tree
+        .tree_ids()
+        .as_resolved()
+        .ok_or_else(|| std::io::Error::other("snapshot produced unexpected conflicted tree"))?
+        .clone();
     let new_tree_hex = new_tree_id.hex();
     let dirty_count = dirty_map.len();
 
@@ -599,7 +612,6 @@ async fn snapshot_workspace_local_inner(
     }
 
     let old_commit = old_commit_opt.expect("verified when publish_op is true");
-    let new_merged_tree = MergedTree::resolved(Arc::clone(&store), new_tree_id);
 
     let mut tx = repo.start_transaction();
     let rewritten = tx
@@ -809,7 +821,7 @@ fn default_snapshot_settings() -> Result<UserSettings, JjError> {
     let layer = ConfigLayer::parse(ConfigSource::User, cfg_text)
         .map_err(|e| std::io::Error::other(format!("config parse error: {e}")))?;
     config.add_layer(layer);
-    UserSettings::from_config(config)
+    UserSettings::from_config_and_home_dir(config, None)
         .map_err(|e| std::io::Error::other(format!("settings error: {e}")).into())
 }
 
@@ -879,10 +891,10 @@ mod tests {
             Err(Status::unimplemented("unused"))
         }
 
-        async fn list_project_commits(
+        async fn delete_repository(
             &self,
-            _: Request<ListProjectCommitsRequest>,
-        ) -> Result<Response<ListProjectCommitsResponse>, Status> {
+            _: Request<DeleteRepositoryRequest>,
+        ) -> Result<Response<DeleteRepositoryResponse>, Status> {
             Err(Status::unimplemented("unused"))
         }
 
@@ -1051,31 +1063,47 @@ mod tests {
             .write_file(&file1_rp, &mut &b"side A\n"[..])
             .await
             .unwrap();
-        let mut tb_a = TreeBuilder::new(Arc::clone(&store), tid_base.clone());
-        tb_a.set(
+        let mut tb_a =
+            MergedTreeBuilder::new(MergedTree::resolved(Arc::clone(&store), tid_base.clone()));
+        tb_a.set_or_remove(
             file1_rp.clone(),
-            jj_lib::backend::TreeValue::File {
+            Some(jj_lib::backend::TreeValue::File {
                 id: fid_a,
                 executable: false,
                 copy_id: CopyId::placeholder(),
-            },
+            }),
         );
-        let tid_a = tb_a.write_tree().await.unwrap();
+        let tid_a = tb_a
+            .write_tree()
+            .await
+            .unwrap()
+            .tree_ids()
+            .as_resolved()
+            .unwrap()
+            .clone();
 
         let fid_b = store
             .write_file(&file1_rp, &mut &b"side B\n"[..])
             .await
             .unwrap();
-        let mut tb_b = TreeBuilder::new(Arc::clone(&store), tid_base.clone());
-        tb_b.set(
+        let mut tb_b =
+            MergedTreeBuilder::new(MergedTree::resolved(Arc::clone(&store), tid_base.clone()));
+        tb_b.set_or_remove(
             file1_rp,
-            jj_lib::backend::TreeValue::File {
+            Some(jj_lib::backend::TreeValue::File {
                 id: fid_b,
                 executable: false,
                 copy_id: CopyId::placeholder(),
-            },
+            }),
         );
-        let tid_b = tb_b.write_tree().await.unwrap();
+        let tid_b = tb_b
+            .write_tree()
+            .await
+            .unwrap()
+            .tree_ids()
+            .as_resolved()
+            .unwrap()
+            .clone();
 
         let conflicted_tree = MergedTree::new(
             Arc::clone(&store),

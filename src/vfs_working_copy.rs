@@ -443,7 +443,7 @@ impl WorkingCopyFactory for VfsWorkingCopyFactory {
         settings: &UserSettings,
     ) -> Result<Box<dyn WorkingCopy>, WorkingCopyStateError> {
         let paths = InstancePaths::resolve(None, None);
-        let user = cc_lib::cc_working_copy::resolve_workspace_user(settings);
+        let user = cc_lib::cc_working_copy::resolve_user(settings)?;
         let ws_key = WorkspaceKey {
             source: "default".to_string(),
             repo: "default".to_string(),
@@ -586,7 +586,7 @@ mod tests {
             )
             .unwrap(),
         );
-        UserSettings::from_config(cfg).unwrap()
+        UserSettings::from_config_and_home_dir(cfg, None).unwrap()
     }
 
     #[tokio::test]

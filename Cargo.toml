@@ -29,18 +29,18 @@ license = "Apache-2.0"
 [workspace.dependencies]
 anyhow = "1.0.103"
 async-trait = "0.1.89"
-cc-common = { git = "https://github.com/DanielSperry/jj-commit-cloud.git", rev = "cf8df8b5e76934956049a39aa4504616f3bd58bc" }
-cc-lib = { git = "https://github.com/DanielSperry/jj-commit-cloud.git", rev = "cf8df8b5e76934956049a39aa4504616f3bd58bc" }
+cc-common = { git = "https://github.com/jj-vcs/jj-commit-cloud.git", rev = "27fb0e3d0721ba7a175d1d9976935b8894c23d42" }
+cc-lib = { git = "https://github.com/jj-vcs/jj-commit-cloud.git", rev = "27fb0e3d0721ba7a175d1d9976935b8894c23d42" }
 clap = { version = "4.6.1", features = ["derive", "env"] }
 dashmap = "6.2.1"
 fuser = "0.18.0"
 futures = "0.3.33"
-gix = { version = "0.85.0", default-features = false, features = ["max-performance-safe"] }
+gix = { version = "0.90.0", default-features = false, features = ["max-performance"] }
 hex = "0.4.3"
 hyper-util = { version = "0.1.20", features = ["tokio"] }
 itertools = "0.15.0"
-jj-cli = "0.43.0"
-jj-lib = "0.43.0"
+jj-cli = "0.47.1"
+jj-lib = "0.47.1"
 libc = "0.2.186"
 parking_lot = "0.12.5"
 pollster = "0.4.0"

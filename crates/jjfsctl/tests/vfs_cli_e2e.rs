@@ -153,29 +153,35 @@ async fn jj_cli_operates_on_fuse_mounted_commit_cloud_workspace_via_vfs_working_
             let mut oclient = OpStoreServiceClient::connect(server_url.clone())
                 .await
                 .unwrap();
-            let op_head = oclient
+            let reconcile = oclient
                 .reconcile_op_heads(ReconcileOpHeadsRequest {
                     repo_id: repo_id.to_string(),
                 })
                 .await
                 .unwrap()
-                .into_inner()
-                .op_head;
+                .into_inner();
+            assert!(!reconcile.client_resolution_required);
+            let op_head = reconcile.op_head;
             let mut wclient = WorkspaceServiceClient::connect(server_url.clone())
                 .await
                 .unwrap();
+            #[allow(deprecated)]
+            let ws_state = WorkspaceState {
+                repo_id: repo_id.to_string(),
+                user: user.to_string(),
+                workspace_name: "default".to_string(),
+                commit_id: vec![0u8; 20],
+                operation_id: op_head,
+                tree_id: cc_common::EMPTY_TREE_ID_BYTES.to_vec(),
+                sparse_patterns: vec![String::new()],
+                tree_ids: vec![cc_common::EMPTY_TREE_ID_BYTES.to_vec()],
+                conflict_labels: Vec::new(),
+                sparse_patterns_set: true,
+            };
             wclient
                 .update_workspace(UpdateWorkspaceRequest {
-                    workspace: Some(WorkspaceState {
-                        repo_id: repo_id.to_string(),
-                        user: user.to_string(),
-                        workspace_name: "default".to_string(),
-                        commit_id: vec![0u8; 20],
-                        operation_id: op_head,
-                        tree_id: cc_common::EMPTY_TREE_ID_BYTES.to_vec(),
-                        sparse_patterns: Vec::new(),
-                        tree_ids: vec![cc_common::EMPTY_TREE_ID_BYTES.to_vec()],
-                    }),
+                    workspace: Some(ws_state),
+                    expected_operation_id: None,
                 })
                 .await
                 .unwrap();

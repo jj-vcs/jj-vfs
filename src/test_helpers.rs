@@ -25,15 +25,19 @@ use jj_lib::backend::{self};
 use jj_lib::config::ConfigLayer;
 use jj_lib::config::ConfigSource;
 use jj_lib::config::StackedConfig;
+use jj_lib::default_backend_factories::default_backend_factories;
+use jj_lib::default_backend_factories::default_working_copy_factories;
 use jj_lib::merge::Merge;
+use jj_lib::merged_tree::MergedTree;
+use jj_lib::merged_tree_builder::MergedTreeBuilder;
+use jj_lib::ref_name::WorkspaceName;
 use jj_lib::repo::ReadonlyRepo;
 use jj_lib::repo::Repo as _;
-use jj_lib::repo::StoreFactories;
 use jj_lib::repo_path::RepoPathBuf;
 use jj_lib::settings::UserSettings;
-use jj_lib::tree_builder::TreeBuilder;
+use jj_lib::workspace::DefaultWorkspaceLoaderFactory;
 use jj_lib::workspace::Workspace;
-use jj_lib::workspace::default_working_copy_factories;
+use jj_lib::workspace::WorkspaceLoaderFactory as _;
 
 pub fn user_settings() -> UserSettings {
     let config_text = r#"
@@ -45,7 +49,7 @@ pub fn user_settings() -> UserSettings {
     "#;
     let mut config = StackedConfig::with_defaults();
     config.add_layer(ConfigLayer::parse(ConfigSource::User, config_text).unwrap());
-    UserSettings::from_config(config).unwrap()
+    UserSettings::from_config_and_home_dir(config, None).unwrap()
 }
 
 pub async fn setup_test_repo() -> (tempfile::TempDir, Arc<ReadonlyRepo>, CommitId) {
@@ -54,14 +58,18 @@ pub async fn setup_test_repo() -> (tempfile::TempDir, Arc<ReadonlyRepo>, CommitI
     let workspace_root = temp_dir.path().to_path_buf();
 
     // Initialize a simple workspace
-    let (workspace, repo) = Workspace::init_simple(&settings, &workspace_root)
-        .await
-        .unwrap();
+    let (workspace, repo) =
+        Workspace::init_simple(&settings, &workspace_root, WorkspaceName::DEFAULT)
+            .await
+            .unwrap();
 
     let store = repo.store().clone();
 
     // Create a tree with a file and a subdirectory containing a file
-    let mut tree_builder = TreeBuilder::new(store.clone(), store.empty_tree_id().clone());
+    let mut tree_builder = MergedTreeBuilder::new(MergedTree::resolved(
+        store.clone(),
+        store.empty_tree_id().clone(),
+    ));
 
     let file1_path = RepoPathBuf::from_relative_path(Path::new("file1.txt")).unwrap();
     let file2_path = RepoPathBuf::from_relative_path(Path::new("dir/file2.txt")).unwrap();
@@ -73,26 +81,26 @@ pub async fn setup_test_repo() -> (tempfile::TempDir, Arc<ReadonlyRepo>, CommitI
         .write_file(&file1_path, &mut &file1_content[..])
         .await
         .unwrap();
-    tree_builder.set(
+    tree_builder.set_or_remove(
         file1_path.clone(),
-        TreeValue::File {
+        Some(TreeValue::File {
             id: file1_id,
             executable: false,
             copy_id: CopyId::placeholder(),
-        },
+        }),
     );
 
     let file2_id = store
         .write_file(&file2_path, &mut &file2_content[..])
         .await
         .unwrap();
-    tree_builder.set(
+    tree_builder.set_or_remove(
         file2_path.clone(),
-        TreeValue::File {
+        Some(TreeValue::File {
             id: file2_id,
             executable: false,
             copy_id: CopyId::placeholder(),
-        },
+        }),
     );
 
     let symlink_path = RepoPathBuf::from_relative_path(Path::new("symlink")).unwrap();
@@ -100,9 +108,16 @@ pub async fn setup_test_repo() -> (tempfile::TempDir, Arc<ReadonlyRepo>, CommitI
         .write_symlink(&symlink_path, "file1.txt")
         .await
         .unwrap();
-    tree_builder.set(symlink_path, TreeValue::Symlink(symlink_id));
+    tree_builder.set_or_remove(symlink_path, Some(TreeValue::Symlink(symlink_id)));
 
-    let tree_id = tree_builder.write_tree().await.unwrap();
+    let tree_id = tree_builder
+        .write_tree()
+        .await
+        .unwrap()
+        .tree_ids()
+        .as_resolved()
+        .unwrap()
+        .clone();
 
     // Write a commit pointing to this tree
     let signature = Signature {
@@ -135,15 +150,17 @@ pub async fn setup_test_repo() -> (tempfile::TempDir, Arc<ReadonlyRepo>, CommitI
     let _repo = tx.commit("set working copy").await.unwrap();
 
     // Load the readonly repo at head
-    let loaded_workspace = Workspace::load(
-        &settings,
-        &workspace_root,
-        &StoreFactories::default(),
-        &default_working_copy_factories(),
-    )
-    .unwrap();
+    let loaded_workspace = DefaultWorkspaceLoaderFactory
+        .create(&workspace_root)
+        .unwrap()
+        .load(
+            &settings,
+            &default_backend_factories(),
+            &default_working_copy_factories(),
+        )
+        .unwrap();
     let repo_loader = loaded_workspace.repo_loader();
-    let readonly_repo = repo_loader.load_at_head().await.unwrap();
+    let readonly_repo = repo_loader.load_at_head(None).await.unwrap();
 
     (temp_dir, readonly_repo, commit.id().clone())
 }

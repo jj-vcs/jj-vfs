@@ -109,6 +109,8 @@ const ROOT_COMMIT_HEX: &str = "0000000000000000000000000000000000000000";
 const STREAM_UPLOAD_THRESHOLD: usize = 512 * 1024;
 const STREAM_CHUNK_BYTES: usize = 64 * 1024;
 const TREE_PAGE_SIZE: u32 = 1000;
+const WORKSPACE_PAGE_SIZE: u32 = 500;
+const MAX_WORKSPACE_PAGES: usize = 10_000;
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_RPC_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_TOKEN_CMD_TTL: Duration = Duration::from_secs(45 * 60);
@@ -694,13 +696,21 @@ impl CommitCloudVfsBackend {
                 let repo_id = repo_id.clone();
                 async move {
                     let mut client = build_op_store_client(ch, int);
-                    let op_head = client
+                    let reconcile = client
                         .reconcile_op_heads(ReconcileOpHeadsRequest {
                             repo_id: repo_id.clone(),
                         })
                         .await?
-                        .into_inner()
-                        .op_head;
+                        .into_inner();
+                    if reconcile.client_resolution_required || reconcile.op_head.is_empty() {
+                        let head_count = reconcile.current_op_head_ids.len();
+                        return Err(Status::failed_precondition(format!(
+                            "repository '{repo_id}' has {head_count} divergent operation heads \
+                             requiring client-side descendant rebasing; run `jj status` or `jj op \
+                             log` inside a workspace to reconcile"
+                        )));
+                    }
+                    let op_head = reconcile.op_head;
                     let op = client
                         .read_operation(ReadOperationRequest {
                             repo_id: repo_id.clone(),
@@ -771,6 +781,7 @@ impl CommitCloudVfsBackend {
             })
             .await?
         } else {
+            let total_size = data.len() as u64;
             let chunks: Vec<WriteFileChunk> = data
                 .chunks(STREAM_CHUNK_BYTES)
                 .enumerate()
@@ -781,6 +792,8 @@ impl CommitCloudVfsBackend {
                         String::new()
                     },
                     chunk: slice.to_vec(),
+                    total_size: (idx == 0).then_some(total_size),
+                    expected_file_id: None,
                 })
                 .collect();
             let fallback_payload = data.to_vec();
@@ -936,19 +949,7 @@ impl CommitCloudVfsBackend {
 
         if let Some(mut ws) = workspace_state {
             ws.operation_id = new_op_id.clone();
-            self.run_rpc(|ch, int| {
-                let ws = ws.clone();
-                async move {
-                    let mut ws_client = build_workspace_client(ch, int);
-                    let _ = ws_client
-                        .update_workspace(UpdateWorkspaceRequest {
-                            workspace: Some(ws),
-                        })
-                        .await?;
-                    Ok(())
-                }
-            })
-            .await?;
+            self.update_workspace_state_cas(ws, None).await?;
         }
         Ok(new_op_id)
     }
@@ -957,13 +958,23 @@ impl CommitCloudVfsBackend {
         &self,
         workspace: ProtoWorkspaceState,
     ) -> Result<(), JjError> {
+        self.update_workspace_state_cas(workspace, None).await
+    }
+
+    pub async fn update_workspace_state_cas(
+        &self,
+        workspace: ProtoWorkspaceState,
+        expected_operation_id: Option<Vec<u8>>,
+    ) -> Result<(), JjError> {
         self.run_rpc(|ch, int| {
             let ws = workspace.clone();
+            let expected = expected_operation_id.clone();
             async move {
                 let mut ws_client = build_workspace_client(ch, int);
                 let _ = ws_client
                     .update_workspace(UpdateWorkspaceRequest {
                         workspace: Some(ws),
+                        expected_operation_id: expected,
                     })
                     .await?;
                 Ok(())
@@ -1371,6 +1382,9 @@ impl ReadOnlyVfsBackend for CommitCloudVfsBackend {
                         .resolve_change_prefix(ResolveChangePrefixRequest {
                             project_id: repo_id,
                             prefix: req_pfx,
+                            repo_id: None,
+                            visible_head_ids: Vec::new(),
+                            max_results: 0,
                         })
                         .await?
                         .into_inner())
@@ -1437,20 +1451,48 @@ impl ReadOnlyVfsBackend for CommitCloudVfsBackend {
         &self,
         user_filter: Option<&str>,
     ) -> Result<Vec<VfsWorkspaceRef>, JjError> {
-        let repo_id = self.repo_id.clone();
-        let listed = self
-            .run_rpc(|ch, int| {
-                let repo_id = repo_id.clone();
-                async move {
-                    let mut ws_client = build_workspace_client(ch, int);
-                    Ok(ws_client
-                        .list_workspaces(ListWorkspacesRequest { repo_id })
-                        .await?
-                        .into_inner()
-                        .workspaces)
-                }
-            })
-            .await?;
+        let mut listed = Vec::new();
+        let mut page_token = String::new();
+        let mut seen_tokens = BTreeSet::new();
+        for _ in 0..MAX_WORKSPACE_PAGES {
+            let repo_id = self.repo_id.clone();
+            let token = page_token.clone();
+            let resp = self
+                .run_rpc(|ch, int| {
+                    let repo_id = repo_id.clone();
+                    let token = token.clone();
+                    async move {
+                        let mut ws_client = build_workspace_client(ch, int);
+                        Ok(ws_client
+                            .list_workspaces(ListWorkspacesRequest {
+                                repo_id,
+                                page_size: WORKSPACE_PAGE_SIZE,
+                                page_token: token,
+                            })
+                            .await?
+                            .into_inner())
+                    }
+                })
+                .await?;
+            listed.extend(resp.workspaces);
+            if resp.next_page_token.is_empty() {
+                page_token.clear();
+                break;
+            }
+            if !seen_tokens.insert(resp.next_page_token.clone()) {
+                return Err(JjError::Grpc(format!(
+                    "ListWorkspaces returned repeated pagination cursor '{}' for repo '{}'",
+                    resp.next_page_token, self.repo_id
+                )));
+            }
+            page_token = resp.next_page_token;
+        }
+        if !page_token.is_empty() {
+            return Err(JjError::Grpc(format!(
+                "ListWorkspaces exceeded {MAX_WORKSPACE_PAGES} pages for repo '{}'",
+                self.repo_id
+            )));
+        }
         if !listed.is_empty() {
             self.mark_verified();
         }
@@ -1465,14 +1507,18 @@ impl ReadOnlyVfsBackend for CommitCloudVfsBackend {
             }
             seen_names.insert(ws.workspace_name.clone());
             let cid_hex = hex::encode(&ws.commit_id);
+            #[allow(deprecated)]
+            let legacy_tree_id = ws.tree_id;
             let (tid_hex, tree_ids_hex, conflict_labels) = if !ws.tree_ids.is_empty() {
                 let tids: Vec<String> = ws.tree_ids.iter().map(hex::encode).collect();
-                let primary = if !ws.tree_id.is_empty() {
-                    hex::encode(&ws.tree_id)
+                let primary = if !legacy_tree_id.is_empty() {
+                    hex::encode(&legacy_tree_id)
                 } else {
                     tids[0].clone()
                 };
-                let labels = if tids.len() > 1 && !cid_hex.is_empty() {
+                let labels = if !ws.conflict_labels.is_empty() {
+                    ws.conflict_labels
+                } else if tids.len() > 1 && !cid_hex.is_empty() {
                     self.fetch_commit(&cid_hex)
                         .await
                         .map(|c| c.conflict_labels.clone())
@@ -1481,9 +1527,9 @@ impl ReadOnlyVfsBackend for CommitCloudVfsBackend {
                     Vec::new()
                 };
                 (primary, tids, labels)
-            } else if !ws.tree_id.is_empty() {
-                let primary = hex::encode(&ws.tree_id);
-                (primary.clone(), vec![primary], Vec::new())
+            } else if !legacy_tree_id.is_empty() {
+                let primary = hex::encode(&legacy_tree_id);
+                (primary.clone(), vec![primary], ws.conflict_labels)
             } else {
                 let commit = self.fetch_commit(&cid_hex).await?;
                 let tids: Vec<String> = if commit.root_tree_id.is_empty() {
@@ -1859,8 +1905,12 @@ mod tests {
         trees: DashMap<Vec<u8>, Vec<TreeEntry>>,
         blobs: DashMap<Vec<u8>, Vec<u8>>,
         symlinks: DashMap<Vec<u8>, String>,
+        workspaces: Mutex<Vec<WorkspaceState>>,
+        workspace_page_size: Mutex<Option<usize>>,
+        repeat_workspace_page_token: AtomicBool,
         active_view: Mutex<Option<View>>,
         active_op_head: Mutex<Option<Vec<u8>>>,
+        reconcile_requires_client: AtomicBool,
         required_bearer: Mutex<Option<String>>,
         seen_auth_headers: Mutex<Vec<Option<String>>>,
         legacy_ignore_range: AtomicBool,
@@ -1972,11 +2022,12 @@ mod tests {
             Err(Status::unimplemented("mock"))
         }
 
-        async fn list_project_commits(
+        async fn delete_repository(
             &self,
-            _req: Request<ListProjectCommitsRequest>,
-        ) -> Result<Response<ListProjectCommitsResponse>, Status> {
-            Ok(Response::new(ListProjectCommitsResponse::default()))
+            req: Request<DeleteRepositoryRequest>,
+        ) -> Result<Response<DeleteRepositoryResponse>, Status> {
+            self.check_auth(&req)?;
+            Ok(Response::new(DeleteRepositoryResponse { existed: true }))
         }
 
         async fn list_commits(
@@ -2045,6 +2096,7 @@ mod tests {
                         status: ObjectPrefixStatus::ObjectPrefixSingleMatch as i32,
                         matched_change_id: chg,
                         commit_ids: cids,
+                        truncated: false,
                     }))
                 }
                 _ => Ok(Response::new(ResolveChangePrefixResponse {
@@ -2224,12 +2276,23 @@ mod tests {
             req: Request<ReconcileOpHeadsRequest>,
         ) -> Result<Response<ReconcileOpHeadsResponse>, Status> {
             self.check_auth(&req)?;
+            if self.reconcile_requires_client.load(Ordering::SeqCst) {
+                return Ok(Response::new(ReconcileOpHeadsResponse {
+                    op_head: Vec::new(),
+                    client_resolution_required: true,
+                    current_op_head_ids: vec![vec![1u8; 16], vec![2u8; 16]],
+                }));
+            }
             let op_head = self
                 .active_op_head
                 .lock()
                 .clone()
                 .unwrap_or_else(|| vec![1u8; 16]);
-            Ok(Response::new(ReconcileOpHeadsResponse { op_head }))
+            Ok(Response::new(ReconcileOpHeadsResponse {
+                op_head: op_head.clone(),
+                client_resolution_required: false,
+                current_op_head_ids: vec![op_head],
+            }))
         }
 
         async fn publish_operation(
@@ -2251,9 +2314,12 @@ mod tests {
 
         async fn update_workspace(
             &self,
-            _req: Request<UpdateWorkspaceRequest>,
+            req: Request<UpdateWorkspaceRequest>,
         ) -> Result<Response<UpdateWorkspaceResponse>, Status> {
-            Ok(Response::new(UpdateWorkspaceResponse { success: true }))
+            Ok(Response::new(UpdateWorkspaceResponse {
+                success: true,
+                workspace: req.into_inner().workspace,
+            }))
         }
 
         async fn list_workspaces(
@@ -2261,7 +2327,40 @@ mod tests {
             req: Request<ListWorkspacesRequest>,
         ) -> Result<Response<ListWorkspacesResponse>, Status> {
             self.check_auth(&req)?;
-            Ok(Response::new(ListWorkspacesResponse { workspaces: vec![] }))
+            let inner = req.into_inner();
+            let all = self.workspaces.lock().clone();
+            if all.is_empty() {
+                return Ok(Response::new(ListWorkspacesResponse {
+                    workspaces: vec![],
+                    next_page_token: String::new(),
+                }));
+            }
+            let start = if inner.page_token.is_empty() || inner.page_token == "stuck-cursor" {
+                0
+            } else {
+                inner
+                    .page_token
+                    .parse::<usize>()
+                    .map_err(|_| Status::invalid_argument("bad page_token"))?
+            };
+            let page_sz = self
+                .workspace_page_size
+                .lock()
+                .unwrap_or(all.len().max(1))
+                .max(1);
+            let end = (start + page_sz).min(all.len());
+            let page = all[start.min(all.len())..end].to_vec();
+            let next_page_token = if self.repeat_workspace_page_token.load(Ordering::SeqCst) {
+                "stuck-cursor".to_string()
+            } else if end < all.len() {
+                end.to_string()
+            } else {
+                String::new()
+            };
+            Ok(Response::new(ListWorkspacesResponse {
+                workspaces: page,
+                next_page_token,
+            }))
         }
 
         async fn check_working_copy_changes(
@@ -2275,7 +2374,7 @@ mod tests {
             &self,
             _req: Request<DeleteWorkspaceRequest>,
         ) -> Result<Response<DeleteWorkspaceResponse>, Status> {
-            Ok(Response::new(DeleteWorkspaceResponse { success: true }))
+            Ok(Response::new(DeleteWorkspaceResponse { existed: true }))
         }
     }
 
@@ -2894,6 +2993,114 @@ mod tests {
         match err {
             JjError::IO(io_err) => assert_eq!(io_err.kind(), std::io::ErrorKind::TimedOut),
             other => panic!("expected TimedOut IO error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn fetch_reconciled_view_surfaces_client_resolution_required() {
+        let srv = MockSvc::default();
+        srv.reconcile_requires_client.store(true, Ordering::SeqCst);
+        let addr = spawn_mock_server(srv).await;
+
+        let cas_dir = tempfile::tempdir().unwrap();
+        let cas = Arc::new(BlobCas::new(cas_dir.path(), 0).unwrap());
+        let backend = CommitCloudVfsBackend::new(
+            "corp",
+            "webapp",
+            format!("http://{addr}"),
+            CcSourceAuth::default(),
+            cas,
+        );
+        let err = backend.fetch_reconciled_view().await.unwrap_err();
+        match err {
+            JjError::Grpc(msg) => {
+                assert!(
+                    msg.contains("2 divergent operation heads") && msg.contains("jj status"),
+                    "expected actionable divergent-head error, got: {msg}"
+                );
+            }
+            other => panic!("expected Grpc error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn list_workspaces_paginates_preserves_conflict_labels_and_guards_stalled_cursor() {
+        let srv = MockSvc::default();
+        let t1 = vec![0x11; 20];
+        let t2 = vec![0x22; 20];
+        let t3 = vec![0x33; 20];
+        let cid = vec![0x44; 20];
+        let op = vec![0x55; 16];
+        #[allow(deprecated)]
+        let ws_entries = vec![
+            WorkspaceState {
+                repo_id: "webapp".into(),
+                user: "alice".into(),
+                workspace_name: "default".into(),
+                commit_id: cid.clone(),
+                operation_id: op.clone(),
+                tree_id: t1.clone(),
+                sparse_patterns: vec![String::new()],
+                tree_ids: vec![t1.clone()],
+                conflict_labels: Vec::new(),
+                sparse_patterns_set: true,
+            },
+            WorkspaceState {
+                repo_id: "webapp".into(),
+                user: "alice".into(),
+                workspace_name: "conflict-ws".into(),
+                commit_id: cid.clone(),
+                operation_id: op.clone(),
+                tree_id: t1.clone(),
+                sparse_patterns: vec![String::new()],
+                tree_ids: vec![t1.clone(), t2.clone(), t3.clone()],
+                conflict_labels: vec!["ours".into(), "base".into(), "theirs".into()],
+                sparse_patterns_set: true,
+            },
+            WorkspaceState {
+                repo_id: "webapp".into(),
+                user: "bob".into(),
+                workspace_name: "agent-1".into(),
+                commit_id: cid,
+                operation_id: op,
+                tree_id: t2.clone(),
+                sparse_patterns: vec![String::new()],
+                tree_ids: vec![t2],
+                conflict_labels: Vec::new(),
+                sparse_patterns_set: true,
+            },
+        ];
+        *srv.workspaces.lock() = ws_entries;
+        *srv.workspace_page_size.lock() = Some(1);
+        let addr = spawn_mock_server(srv.clone()).await;
+
+        let cas_dir = tempfile::tempdir().unwrap();
+        let cas = Arc::new(BlobCas::new(cas_dir.path(), 0).unwrap());
+        let backend = CommitCloudVfsBackend::new(
+            "corp",
+            "webapp",
+            format!("http://{addr}"),
+            CcSourceAuth::default(),
+            cas,
+        );
+
+        let all = backend.list_workspaces(None).await.unwrap();
+        assert_eq!(all.len(), 3);
+        let conflict = all
+            .iter()
+            .find(|w| w.workspace_name == "conflict-ws")
+            .unwrap();
+        assert_eq!(conflict.tree_ids_hex.len(), 3);
+        assert_eq!(conflict.conflict_labels, vec!["ours", "base", "theirs"]);
+
+        // A buggy server repeating the same non-empty page_token must error
+        // rather than looping forever.
+        srv.repeat_workspace_page_token
+            .store(true, Ordering::SeqCst);
+        let err = backend.list_workspaces(None).await.unwrap_err();
+        match err {
+            JjError::Grpc(msg) => assert!(msg.contains("repeated pagination cursor"), "{msg}"),
+            other => panic!("expected repeated pagination cursor error, got {other:?}"),
         }
     }
 }

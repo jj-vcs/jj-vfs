@@ -2671,8 +2671,8 @@ mod tests {
         use jj_lib::backend::CopyId;
         use jj_lib::backend::TreeValue;
         use jj_lib::merged_tree::MergedTree;
+        use jj_lib::merged_tree_builder::MergedTreeBuilder;
         use jj_lib::repo::Repo as _;
-        use jj_lib::tree_builder::TreeBuilder;
 
         let (_ws_tmp, repo, cid) = setup_test_repo().await;
         // Add a multi-chunk (> COPY_CHUNK_BYTES) blob to the base commit to
@@ -2680,7 +2680,7 @@ mod tests {
         let store = repo.store().clone();
         let c1 = store.get_commit(&cid).unwrap();
         let tid = c1.tree_ids().as_resolved().unwrap().clone();
-        let mut tb = TreeBuilder::new(Arc::clone(&store), tid);
+        let mut tb = MergedTreeBuilder::new(MergedTree::resolved(Arc::clone(&store), tid));
         let big_len = (COPY_CHUNK_BYTES as usize) * 2 + 12345;
         let big_payload: Vec<u8> = (0..big_len).map(|i| (i % 251) as u8).collect();
         let big_rp = RepoPathBuf::from_internal_string("big.bin").unwrap();
@@ -2688,19 +2688,19 @@ mod tests {
             .write_file(&big_rp, &mut &big_payload[..])
             .await
             .unwrap();
-        tb.set(
+        tb.set_or_remove(
             big_rp,
-            TreeValue::File {
+            Some(TreeValue::File {
                 id: big_fid,
                 executable: true,
                 copy_id: CopyId::placeholder(),
-            },
+            }),
         );
-        let tid2 = tb.write_tree().await.unwrap();
+        let tree2 = tb.write_tree().await.unwrap();
         let mut tx = repo.start_transaction();
         let c2 = tx
             .repo_mut()
-            .new_commit(vec![cid], MergedTree::resolved(Arc::clone(&store), tid2))
+            .new_commit(vec![cid], tree2)
             .set_description("with big blob")
             .write()
             .await

@@ -625,19 +625,26 @@ impl DaemonRuntime {
                 .iter()
                 .filter_map(|h| hex::decode(h).ok())
                 .collect();
-            if let Err(err) = cc
-                .update_workspace_state(cc_common::workspace::WorkspaceState {
-                    repo_id: cc.repo_id().to_string(),
-                    user: key.user.clone(),
-                    workspace_name: key.workspace.clone(),
-                    commit_id: cid_b,
-                    operation_id: op_b,
-                    tree_id: tid_b,
-                    sparse_patterns: Vec::new(),
-                    tree_ids: all_tids,
-                })
-                .await
-            {
+            let conflict_labels =
+                if all_tids.len() > 1 && ws_ref.conflict_labels.len() == all_tids.len() {
+                    ws_ref.conflict_labels.clone()
+                } else {
+                    Vec::new()
+                };
+            #[allow(deprecated)]
+            let ws_state = cc_common::workspace::WorkspaceState {
+                repo_id: cc.repo_id().to_string(),
+                user: key.user.clone(),
+                workspace_name: key.workspace.clone(),
+                commit_id: cid_b,
+                operation_id: op_b,
+                tree_id: tid_b,
+                sparse_patterns: vec![String::new()],
+                tree_ids: all_tids,
+                conflict_labels,
+                sparse_patterns_set: true,
+            };
+            if let Err(err) = cc.update_workspace_state(ws_state).await {
                 tracing::warn!(
                     workspace = ?key,
                     error = %err,
@@ -1099,12 +1106,13 @@ async fn is_local_op_strict_ancestor(
     use jj_lib::config::ConfigLayer;
     use jj_lib::config::ConfigSource;
     use jj_lib::config::StackedConfig;
+    use jj_lib::default_backend_factories::default_backend_factories;
+    use jj_lib::default_backend_factories::default_working_copy_factories;
     use jj_lib::object_id::ObjectId as _;
     use jj_lib::op_store::OperationId;
-    use jj_lib::repo::StoreFactories;
     use jj_lib::settings::UserSettings;
-    use jj_lib::workspace::Workspace;
-    use jj_lib::workspace::default_working_copy_factories;
+    use jj_lib::workspace::DefaultWorkspaceLoaderFactory;
+    use jj_lib::workspace::WorkspaceLoaderFactory as _;
 
     let Some(ws_root) = local_jj_dir.parent() else {
         return false;
@@ -1116,15 +1124,19 @@ async fn is_local_op_strict_ancestor(
     ) {
         config.add_layer(layer);
     }
-    let Ok(settings) = UserSettings::from_config(config) else {
+    let Ok(settings) = UserSettings::from_config_and_home_dir(config, None) else {
         return false;
     };
-    let Ok(ws) = Workspace::load(
-        &settings,
-        ws_root,
-        &StoreFactories::default(),
-        &default_working_copy_factories(),
-    ) else {
+    let Ok(ws) = DefaultWorkspaceLoaderFactory
+        .create(ws_root)
+        .and_then(|loader| {
+            loader.load(
+                &settings,
+                &default_backend_factories(),
+                &default_working_copy_factories(),
+            )
+        })
+    else {
         return false;
     };
     let op_store = ws.repo_loader().op_store();
@@ -1167,13 +1179,14 @@ async fn resolve_local_wc_commit_at_op(
             use jj_lib::config::ConfigLayer;
             use jj_lib::config::ConfigSource;
             use jj_lib::config::StackedConfig;
+            use jj_lib::default_backend_factories::default_backend_factories;
+            use jj_lib::default_backend_factories::default_working_copy_factories;
             use jj_lib::object_id::ObjectId as _;
             use jj_lib::op_store::OperationId;
             use jj_lib::ref_name::WorkspaceNameBuf;
-            use jj_lib::repo::StoreFactories;
             use jj_lib::settings::UserSettings;
-            use jj_lib::workspace::Workspace;
-            use jj_lib::workspace::default_working_copy_factories;
+            use jj_lib::workspace::DefaultWorkspaceLoaderFactory;
+            use jj_lib::workspace::WorkspaceLoaderFactory as _;
 
             let ws_root = jj_owned.parent().ok_or(JjError::InvalidPath)?;
             let mut config = StackedConfig::with_defaults();
@@ -1183,15 +1196,20 @@ async fn resolve_local_wc_commit_at_op(
             )
             .map_err(|e| std::io::Error::other(format!("config parse error: {e}")))?;
             config.add_layer(layer);
-            let settings = UserSettings::from_config(config)
+            let settings = UserSettings::from_config_and_home_dir(config, None)
                 .map_err(|e| std::io::Error::other(format!("settings error: {e}")))?;
-            let ws = Workspace::load(
-                &settings,
-                ws_root,
-                &StoreFactories::default(),
-                &default_working_copy_factories(),
-            )
-            .map_err(|e| std::io::Error::other(format!("load local workspace failed: {e:?}")))?;
+            let ws = DefaultWorkspaceLoaderFactory
+                .create(ws_root)
+                .and_then(|loader| {
+                    loader.load(
+                        &settings,
+                        &default_backend_factories(),
+                        &default_working_copy_factories(),
+                    )
+                })
+                .map_err(|e| {
+                    std::io::Error::other(format!("load local workspace failed: {e:?}"))
+                })?;
             let op_id = OperationId::try_from_hex(&op_owned).ok_or(JjError::InvalidPath)?;
             let op_store = ws.repo_loader().op_store();
             let op_data = op_store
@@ -1856,9 +1874,9 @@ mod tests {
         use jj_lib::backend::CopyId;
         use jj_lib::backend::TreeValue;
         use jj_lib::merged_tree::MergedTree;
+        use jj_lib::merged_tree_builder::MergedTreeBuilder;
         use jj_lib::repo::Repo as _;
         use jj_lib::repo_path::RepoPathBuf;
-        use jj_lib::tree_builder::TreeBuilder;
 
         let (ws_a, repo_a, cid_v1) = setup_test_repo().await;
 
@@ -1867,29 +1885,28 @@ mod tests {
         let store = repo_a.store().clone();
         let c1 = store.get_commit(&cid_v1).unwrap();
         let tid_v1 = c1.tree_ids().as_resolved().unwrap().clone();
-        let mut tb = TreeBuilder::new(Arc::clone(&store), tid_v1.clone());
+        let mut tb =
+            MergedTreeBuilder::new(MergedTree::resolved(Arc::clone(&store), tid_v1.clone()));
         let file1_rp = RepoPathBuf::from_internal_string("file1.txt").unwrap();
         let new_fid = store
             .write_file(&file1_rp, &mut &b"updated via checkout_tree!"[..])
             .await
             .unwrap();
-        tb.set(
+        tb.set_or_remove(
             file1_rp,
-            TreeValue::File {
+            Some(TreeValue::File {
                 id: new_fid,
                 executable: false,
                 copy_id: CopyId::placeholder(),
-            },
+            }),
         );
-        let tid_v2 = tb.write_tree().await.unwrap();
+        let tree_v2 = tb.write_tree().await.unwrap();
+        let tid_v2 = tree_v2.tree_ids().as_resolved().unwrap().clone();
 
         let mut tx = repo_a.start_transaction();
         let c2 = tx
             .repo_mut()
-            .new_commit(
-                vec![cid_v1.clone()],
-                MergedTree::resolved(Arc::clone(&store), tid_v2.clone()),
-            )
+            .new_commit(vec![cid_v1.clone()], tree_v2)
             .set_description("v2 commit")
             .write()
             .await

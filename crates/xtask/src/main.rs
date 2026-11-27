@@ -367,13 +367,17 @@ async fn seed_cc_repo_and_workspaces(
         .commit_id;
 
     let mut oclient = OpStoreServiceClient::connect(server_url.to_string()).await?;
-    let op_head = oclient
+    let reconcile = oclient
         .reconcile_op_heads(ReconcileOpHeadsRequest {
             repo_id: repo_id.to_string(),
         })
         .await?
-        .into_inner()
-        .op_head;
+        .into_inner();
+    ensure!(
+        !reconcile.client_resolution_required && !reconcile.op_head.is_empty(),
+        "unexpected client_resolution_required during seed_cc_repo_and_workspaces"
+    );
+    let op_head = reconcile.op_head;
     let cur_op = oclient
         .read_operation(ReadOperationRequest {
             repo_id: repo_id.to_string(),
@@ -449,18 +453,23 @@ async fn seed_cc_repo_and_workspaces(
 
     let mut wclient = WorkspaceServiceClient::connect(server_url.to_string()).await?;
     for (ws_name, wc_cid) in ws_commits {
+        #[allow(deprecated)]
+        let ws_state = WorkspaceState {
+            repo_id: repo_id.to_string(),
+            user: user.to_string(),
+            workspace_name: ws_name,
+            commit_id: wc_cid,
+            operation_id: new_op.clone(),
+            tree_id: root_tid.clone(),
+            sparse_patterns: vec![String::new()],
+            tree_ids: vec![root_tid.clone()],
+            conflict_labels: Vec::new(),
+            sparse_patterns_set: true,
+        };
         wclient
             .update_workspace(UpdateWorkspaceRequest {
-                workspace: Some(WorkspaceState {
-                    repo_id: repo_id.to_string(),
-                    user: user.to_string(),
-                    workspace_name: ws_name,
-                    commit_id: wc_cid,
-                    operation_id: new_op.clone(),
-                    tree_id: root_tid.clone(),
-                    sparse_patterns: Vec::new(),
-                    tree_ids: vec![root_tid.clone()],
-                }),
+                workspace: Some(ws_state),
+                expected_operation_id: None,
             })
             .await?;
     }

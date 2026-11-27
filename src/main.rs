@@ -15,12 +15,9 @@
 use std::sync::Arc;
 
 use jj_lib::config::StackedConfig;
-use jj_lib::default_backend_factories::default_backend_factories;
-use jj_lib::default_backend_factories::default_working_copy_factories;
 use jj_lib::settings::UserSettings;
-use jj_lib::workspace::DefaultWorkspaceLoaderFactory;
-use jj_lib::workspace::WorkspaceLoaderFactory as _;
 use jjfsd::path_mapper_all_commits::AllCommitsPathMapper;
+use jjfsd::repo_loading::load_repo_at_head;
 use jjfsd::vfs::PathMappedVfs;
 
 fn main() {
@@ -57,21 +54,9 @@ fn main() {
     )
     .expect("Failed to load user settings");
 
-    let loaded_workspace = DefaultWorkspaceLoaderFactory
-        .create(workspace_root)
-        .and_then(|loader| {
-            loader.load(
-                &settings,
-                &default_backend_factories(),
-                &default_working_copy_factories(),
-            )
-        })
-        .expect("Failed to load workspace");
-
-    let repo_loader = loaded_workspace.repo_loader();
     let readonly_repo = rt
-        .block_on(repo_loader.load_at_head(None))
-        .expect("Failed to load repo at head");
+        .block_on(load_repo_at_head(&settings, workspace_root))
+        .expect("Failed to load repo");
 
     let mapper = AllCommitsPathMapper::new(readonly_repo);
     let filesystem = PathMappedVfs::new(mapper);

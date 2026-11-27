@@ -25,17 +25,15 @@ use jj_lib::backend::{self};
 use jj_lib::config::ConfigLayer;
 use jj_lib::config::ConfigSource;
 use jj_lib::config::StackedConfig;
-use jj_lib::default_backend_factories::default_backend_factories;
-use jj_lib::default_backend_factories::default_working_copy_factories;
 use jj_lib::merged_tree_builder::MergedTreeBuilder;
 use jj_lib::ref_name::WorkspaceName;
 use jj_lib::repo::ReadonlyRepo;
 use jj_lib::repo::Repo as _;
 use jj_lib::repo_path::RepoPathBuf;
 use jj_lib::settings::UserSettings;
-use jj_lib::workspace::DefaultWorkspaceLoaderFactory;
 use jj_lib::workspace::Workspace;
-use jj_lib::workspace::WorkspaceLoaderFactory as _;
+
+use jjfsd::repo_loading::load_repo_at_head;
 
 pub fn user_settings() -> UserSettings {
     let config_text = r#"
@@ -138,18 +136,8 @@ pub async fn setup_test_repo() -> (tempfile::TempDir, Arc<ReadonlyRepo>, CommitI
         .unwrap();
     let _repo = tx.commit("set working copy").await.unwrap();
 
-    // Load the readonly repo at head
-    let loaded_workspace = DefaultWorkspaceLoaderFactory
-        .create(&workspace_root)
-        .unwrap()
-        .load(
-            &settings,
-            &default_backend_factories(),
-            &default_working_copy_factories(),
-        )
-        .unwrap();
-    let repo_loader = loaded_workspace.repo_loader();
-    let readonly_repo = repo_loader.load_at_head(None).await.unwrap();
+    // Load the repo the same way the daemon does
+    let readonly_repo = load_repo_at_head(&settings, &workspace_root).await.unwrap();
 
     (temp_dir, readonly_repo, commit.id().clone())
 }

@@ -15,11 +15,9 @@
 use std::sync::Arc;
 
 use jj_lib::config::StackedConfig;
-use jj_lib::repo::StoreFactories;
 use jj_lib::settings::UserSettings;
-use jj_lib::workspace::Workspace;
-use jj_lib::workspace::default_working_copy_factories;
 use jjfsd::path_mapper_all_commits::AllCommitsPathMapper;
+use jjfsd::repo_loading::load_repo_at_head;
 use jjfsd::vfs::PathMappedVfs;
 
 fn main() {
@@ -48,21 +46,17 @@ fn main() {
     let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
     let _guard = rt.enter();
 
-    let settings = UserSettings::from_config(StackedConfig::with_defaults())
-        .expect("Failed to load user settings");
-
-    let loaded_workspace = Workspace::load(
-        &settings,
-        workspace_root,
-        &StoreFactories::default(),
-        &default_working_copy_factories(),
+    // Pass the home directory so that config paths starting with "~/" expand
+    // the way they did before jj-lib 0.47, which looked it up implicitly.
+    let settings = UserSettings::from_config_and_home_dir(
+        StackedConfig::with_defaults(),
+        std::env::home_dir(),
     )
-    .expect("Failed to load workspace");
+    .expect("Failed to load user settings");
 
-    let repo_loader = loaded_workspace.repo_loader();
     let readonly_repo = rt
-        .block_on(repo_loader.load_at_head())
-        .expect("Failed to load repo at head");
+        .block_on(load_repo_at_head(&settings, workspace_root))
+        .expect("Failed to load repo");
 
     let mapper = AllCommitsPathMapper::new(readonly_repo);
     let filesystem = PathMappedVfs::new(mapper);

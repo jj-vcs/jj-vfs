@@ -15,10 +15,11 @@
 use std::sync::Arc;
 
 use jj_lib::config::StackedConfig;
-use jj_lib::repo::StoreFactories;
+use jj_lib::default_backend_factories::default_backend_factories;
+use jj_lib::default_backend_factories::default_working_copy_factories;
 use jj_lib::settings::UserSettings;
-use jj_lib::workspace::Workspace;
-use jj_lib::workspace::default_working_copy_factories;
+use jj_lib::workspace::DefaultWorkspaceLoaderFactory;
+use jj_lib::workspace::WorkspaceLoaderFactory as _;
 use jjfsd::path_mapper_all_commits::AllCommitsPathMapper;
 use jjfsd::vfs::PathMappedVfs;
 
@@ -48,20 +49,28 @@ fn main() {
     let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
     let _guard = rt.enter();
 
-    let settings = UserSettings::from_config(StackedConfig::with_defaults())
-        .expect("Failed to load user settings");
-
-    let loaded_workspace = Workspace::load(
-        &settings,
-        workspace_root,
-        &StoreFactories::default(),
-        &default_working_copy_factories(),
+    // Pass the home directory so that config paths starting with "~/" expand
+    // the way they did before jj-lib 0.47, which looked it up implicitly.
+    let settings = UserSettings::from_config_and_home_dir(
+        StackedConfig::with_defaults(),
+        std::env::home_dir(),
     )
-    .expect("Failed to load workspace");
+    .expect("Failed to load user settings");
+
+    let loaded_workspace = DefaultWorkspaceLoaderFactory
+        .create(workspace_root)
+        .and_then(|loader| {
+            loader.load(
+                &settings,
+                &default_backend_factories(),
+                &default_working_copy_factories(),
+            )
+        })
+        .expect("Failed to load workspace");
 
     let repo_loader = loaded_workspace.repo_loader();
     let readonly_repo = rt
-        .block_on(repo_loader.load_at_head())
+        .block_on(repo_loader.load_at_head(None))
         .expect("Failed to load repo at head");
 
     let mapper = AllCommitsPathMapper::new(readonly_repo);

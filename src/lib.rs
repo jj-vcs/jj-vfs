@@ -38,6 +38,7 @@ pub mod backend;
 pub mod cas;
 pub mod commit_tree_file;
 pub mod commits_directory;
+pub mod core_vfs_bridge;
 pub mod daemon;
 pub mod fuse;
 pub mod inode_map;

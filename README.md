@@ -143,6 +143,7 @@ cargo xtask bench --workspaces 50
 ## Documentation and Repository Layout
 
 * **Architecture and MVP Design Proposal:** [docs/design.md](docs/design.md)
+* **Shared FUSE Core Architecture (Birdstride):** [src/core_vfs/README.md](src/core_vfs/README.md) and [src/core_vfs_bridge.rs](src/core_vfs_bridge.rs)
 * **Namespace Router and Scoped Mounts:** [src/namespace.rs](src/namespace.rs) and [src/daemon.rs](src/daemon.rs)
 * **Durable Write Overlay and `.gitignore` Split:** [src/overlay.rs](src/overlay.rs)
 * **Zero-Walk Snapshots and `VfsWorkingCopy`:** [src/snapshot.rs](src/snapshot.rs) and [src/vfs_working_copy.rs](src/vfs_working_copy.rs)

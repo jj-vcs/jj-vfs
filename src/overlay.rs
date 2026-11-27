@@ -344,6 +344,17 @@ impl WorkspaceOverlay {
         self.dirty_status().is_some()
     }
 
+    /// Reports whether `rel_str` currently has an unsnapshotted tracked
+    /// mutation (`staged/` file, symlink, directory, or whiteout) in this
+    /// overlay. Always returns `false` for ignored files under `ignored/`.
+    pub fn is_tracked_dirty(&self, rel_str: &str) -> bool {
+        let guard = self.state.read();
+        guard.dirty_files.contains_key(rel_str)
+            || guard.dirty_symlinks.contains_key(rel_str)
+            || guard.dirty_dirs.contains(rel_str)
+            || is_deleted_or_under_deleted(&guard.deleted, rel_str)
+    }
+
     /// Captures a point-in-time snapshot of `(dirty_seq, dirty_map)` for
     /// `snapshot_workspace`.
     pub fn capture_dirty_snapshot(&self) -> (u64, BTreeMap<String, DirtyEntryState>) {

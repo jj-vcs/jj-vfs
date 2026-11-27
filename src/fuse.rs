@@ -114,13 +114,18 @@ impl<FS: VirtualFilesystem + Send + Sync + 'static> Filesystem for JjFuse<FS> {
             parent,
             parent_path => async move {
                 let name_str = name.to_str().ok_or(JjError::InvalidPath)?;
-                let child_ino = inode_map.get_ino(parent, name_str)?;
                 parent_path.push(name_str);
                 let attr = fs.get_attributes(parent_path).await?;
+                let child_ino = inode_map.lookup_ino(parent, name_str)?;
                 Ok(attr.to_fuse(child_ino))
             },
             attr => reply.entry(&TTL, &attr, fuser::Generation(0))
         );
+    }
+
+    #[tracing::instrument(level = "debug", skip(self, _req))]
+    fn forget(&self, _req: &Request, ino: INodeNo, nlookup: u64) {
+        self.inode_map.forget(ino, nlookup);
     }
 
     #[tracing::instrument(level = "debug", skip(self, _req, reply))]
@@ -259,7 +264,7 @@ impl<FS: VirtualFilesystem + Send + Sync + 'static> Filesystem for JjFuse<FS> {
                 let name_str = name.to_str().ok_or(JjError::InvalidPath)?;
                 parent_path.push(name_str);
                 let attr = fs.create_file(parent_path, executable, exclusive).await?;
-                let child_ino = inode_map.get_ino(parent, name_str)?;
+                let child_ino = inode_map.lookup_ino(parent, name_str)?;
                 Ok(attr.to_fuse(child_ino))
             },
             attr => {
@@ -422,7 +427,7 @@ impl<FS: VirtualFilesystem + Send + Sync + 'static> Filesystem for JjFuse<FS> {
                 let name_str = name.to_str().ok_or(JjError::InvalidPath)?;
                 parent_path.push(name_str);
                 let attr = fs.mkdir(parent_path, effective_mode).await?;
-                let child_ino = inode_map.get_ino(parent, name_str)?;
+                let child_ino = inode_map.lookup_ino(parent, name_str)?;
                 Ok(attr.to_fuse(child_ino))
             },
             attr => reply.entry(&TTL, &attr, fuser::Generation(0))
@@ -470,7 +475,7 @@ impl<FS: VirtualFilesystem + Send + Sync + 'static> Filesystem for JjFuse<FS> {
                 let name_str = name.to_str().ok_or(JjError::InvalidPath)?;
                 parent_path.push(name_str);
                 let attr = fs.symlink(parent_path, &owned_target).await?;
-                let child_ino = inode_map.get_ino(parent, name_str)?;
+                let child_ino = inode_map.lookup_ino(parent, name_str)?;
                 Ok(attr.to_fuse(child_ino))
             },
             attr => reply.entry(&TTL, &attr, fuser::Generation(0))
@@ -584,6 +589,7 @@ impl From<JjError> for Errno {
             JjError::DirectoryNotEmpty => Errno::ENOTEMPTY,
             JjError::AlreadyExists => Errno::EEXIST,
             JjError::Busy => Errno::EBUSY,
+            JjError::Unsupported => Errno::ENOTSUP,
             JjError::IO(e) => e
                 .raw_os_error()
                 .filter(|&code| code > 0)

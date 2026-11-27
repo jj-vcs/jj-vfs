@@ -49,6 +49,9 @@ pub enum JjError {
     #[error("Resource is busy")]
     Busy,
 
+    #[error("Operation not supported")]
+    Unsupported,
+
     #[error("{0}")]
     IO(#[from] std::io::Error),
 

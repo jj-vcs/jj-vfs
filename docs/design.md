@@ -307,6 +307,49 @@ Implementation proceeds as an 11-commit linear stack in jj-vfs (beginning with r
 10. **`feat(cache,invalidation)`:** Enable $60\text{ s}$ kernel attribute/entry caching, bounded LRU clean-blob eviction (pinning unacknowledged overlay files), and targeted `fuser::Notifier` kernel invalidation on `CheckoutTree` (`jj new`, `jj edit`, `jj rebase`) and remote workspace head updates.
 11. **`feat(xtask,docs)`:** Add `cargo xtask` end-to-end smoke tests and a $50$-workspace multi-source benchmark across two live jj-cc-server instances plus local repositories, and update [README.md](../README.md) with quickstart and multi-mount workflows.
 
+## Alignment With src/core_vfs (Birdstride) and Multi-Process Architecture
+
+Git Workspaces (Project Birdstride) is extracting a shared Linux FUSE core into [src/core_vfs/README.md](../src/core_vfs/README.md), separating five VCS-agnostic layers: node backend traits (`DirectoryBackend`, `FileBackend`, `SymlinkBackend`), an `InodeStore` packing a 20-bit `WorkspaceId` and 44-bit local inode number into `INodeNo`, deadlock-free 7-case rename locking (`locking.rs`) paired with `LogicalFileHandles`, reusable `VirtualDirectory` and `HydratingDirectoryBackend` directories, and `FuserAdapter` over `vfs_core`.
+
+To align jj-vfs with that extraction without delaying MVP verification or creating merge conflicts in `src/core_vfs/`, [src/core_vfs_bridge.rs](../src/core_vfs_bridge.rs) implements the Layer 1 to Layer 4 adapter seam on top of `ReadOnlyVfsBackend` and `WorkspaceOverlay`:
+
+| `src/core_vfs` Layer | Birdstride Component | jj-vfs Implementation and Alignment Seam |
+| :-- | :-- | :-- |
+| **Layer 1 (Node Traits)** | `DirectoryBackend`, `FileBackend`, `SymlinkBackend` | `JjWorkspaceDirectoryBackend`, `JjWorkspaceFileBackend`, and `JjSymlinkBackend` in [src/core_vfs_bridge.rs](../src/core_vfs_bridge.rs) with algorithm-tagged `ObjectDigest` (`GitBlobSha1` for Commit Cloud M1, `Sha256` for RBE CAS and future chunked Merkle roots) and `ENOTSUP` default on `register_file` |
+| **Layer 2 (Inode Graph)** | `InodeStore` (20-bit `WorkspaceId` + 44-bit local inode) | `encode_inode` / `decode_inode` / `is_same_workspace` for $O(1)$ cross-workspace `EXDEV` checks, plus lookup-counted race-free `forget` and `batch_forget` eviction in [src/inode_map.rs](../src/inode_map.rs) addressing Known Gap #2 in [src/core_vfs/README.md](../src/core_vfs/README.md) |
+| **Layer 3 (Concurrency & Handles)** | `locking.rs` and `LogicalFileHandles` | `JjWorkspaceFileBackend::open` returns `FileDescriptor::NativeHandle` for `overlay/ignored/` build outputs when `passthrough_enabled` is true and `FileDescriptor::Stateless` on unprivileged per-user mounts without `CAP_SYS_ADMIN` and on tracked Commit Cloud files |
+| **Layer 4 (Lazy Directories)** | `HydratingDirectoryBackend` | `HydratingCommitDirectory` serves `getattr` with $0$ `ReadTree` RPCs and transitions `NotHydrated` -> `Hydrated` or sticky `Error` on first `lookup` or `readdir` |
+| **Layer 5 (Process Split)** | `FuserAdapter` + `vfs_core` | Single-process jjfsd keeps `jj_lib` and Commit Cloud RPCs behind `control.sock` and `ReadOnlyVfsBackend` so splitting FUSE transport (`jj-vfs`) from version control (`jj-daemon`) and a local `jj-cc-server` / `jj-cc-daemon` preserves the same overlay, snapshot, and invalidation contracts |
+
+<!--
+Diagram styling and update instructions:
+- Uses Mermaid flowchart TD with at most 2 peer nodes per rank and <br/> line breaks under 26 characters so rendered width stays below 700px.
+- Standard palette classes: #fff3e0 / #e65100 for shared Birdstride FUSE core, #e1f5fe / #01579b for jj-vfs adapters and control plane, and #e8f5e9 / #2e7d32 for VCS and local storage.
+- To update: edit node or edge declarations below and preview the rendered Mermaid block in Markdown.
+-->
+```mermaid
+flowchart TD
+    classDef core fill:#fff3e0,stroke:#e65100,color:#000;
+    classDef adapter fill:#e1f5fe,stroke:#01579b,color:#000;
+    classDef storage fill:#e8f5e9,stroke:#2e7d32,color:#000;
+
+    FuseCore["src/core_vfs<br/>FuserAdapter, vfs_core,<br/>locking.rs, LogicalFileHandles"]:::core
+    Bridge["src/core_vfs_bridge.rs<br/>CoreDirectory/File/Symlink<br/>& HydratingCommitDirectory"]:::adapter
+    Overlay["WorkspaceOverlay<br/>staged/ + journal.log<br/>+ ignored/ (passthrough)"]:::adapter
+    Backend["ReadOnlyVfsBackend &<br/>VfsWorkingCopy"]:::adapter
+    CC["jj-cc-daemon /<br/>jj-cc-server (gRPC)"]:::storage
+    Local["Local jj & Git Repos<br/>(jj-lib & gitoxide)"]:::storage
+
+    FuseCore -->|"Layer 1-4 Traits"| Bridge
+    Bridge -->|"Tracked + Ignored"| Overlay
+    Bridge -->|"Clean Reads + Digests"| Backend
+    Overlay -->|"O(k) Snapshots"| Backend
+    Backend --> CC
+    Backend --> Local
+```
+
+Once Birdstride lands `src/core_vfs/*.rs`, swapping `JjFuse` ([src/fuse.rs](../src/fuse.rs)) to `core_vfs::FuserAdapter` rebinds the bridge traits in [src/core_vfs_bridge.rs](../src/core_vfs_bridge.rs) onto `core_vfs`'s concrete traits without rewriting `SourceRegistry`, `NamespaceRouter`, `WorkspaceOverlay`, `CommitCloudVfsBackend`, or `VfsWorkingCopy`.
+
 ## Vision and Future Directions
 
 * **macOS and Windows Endpoints:** Because `JjFuse` sits above `VirtualFilesystem`, `NamespaceRouter`, and `WorkspaceOverlay`, future milestones can attach a macOS driver via Apple FSKit and macFUSE and a Windows Projected File System (ProjFS) adapter without rewriting source routing, caching, or Commit Cloud synchronization.

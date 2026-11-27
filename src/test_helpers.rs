@@ -15,13 +15,13 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use jj_lib::backend::ChangeId;
 use jj_lib::backend::CommitId;
 use jj_lib::backend::CopyId;
 use jj_lib::backend::MillisSinceEpoch;
 use jj_lib::backend::Signature;
 use jj_lib::backend::Timestamp;
 use jj_lib::backend::TreeValue;
-use jj_lib::backend::{self};
 use jj_lib::config::ConfigLayer;
 use jj_lib::config::ConfigSource;
 use jj_lib::config::StackedConfig;
@@ -32,7 +32,6 @@ use jj_lib::repo::Repo as _;
 use jj_lib::repo_path::RepoPathBuf;
 use jj_lib::settings::UserSettings;
 use jj_lib::workspace::Workspace;
-
 use jjfsd::repo_loading::load_repo_at_head;
 
 pub fn user_settings() -> UserSettings {
@@ -104,9 +103,9 @@ pub async fn setup_test_repo() -> (tempfile::TempDir, Arc<ReadonlyRepo>, CommitI
     tree_builder.set_or_remove(symlink_path, Some(TreeValue::Symlink(symlink_id)));
 
     let tree = tree_builder.write_tree().await.unwrap();
-    let (root_tree, conflict_labels) = tree.into_tree_ids_and_labels();
 
-    // Write a commit pointing to this tree
+    // Write a commit pointing to this tree, with a fixed change ID, author and
+    // committer so that its ID is the same in every run
     let signature = Signature {
         name: "Test User".to_string(),
         email: "test.user@example.com".to_string(),
@@ -115,22 +114,19 @@ pub async fn setup_test_repo() -> (tempfile::TempDir, Arc<ReadonlyRepo>, CommitI
             tz_offset: 0,
         },
     };
-    let commit_data = backend::Commit {
-        parents: vec![store.root_commit_id().clone()],
-        predecessors: vec![],
-        root_tree,
-        conflict_labels: conflict_labels.into_merge(),
-        change_id: backend::ChangeId::from_hex("0000000000000000000000000000abcd"),
-        description: "test commit".to_string(),
-        author: signature.clone(),
-        committer: signature,
-        secure_sig: None,
-    };
-    let commit = store.write_commit(commit_data, None).await.unwrap();
-
-    // Update the working copy commit ID for the workspace name
     let mut tx = repo.start_transaction();
-    tx.repo_mut().add_head(&commit).await.unwrap();
+    let commit = tx
+        .repo_mut()
+        .new_commit(vec![store.root_commit_id().clone()], tree)
+        .set_change_id(ChangeId::from_hex("0000000000000000000000000000abcd"))
+        .set_description("test commit")
+        .set_author(signature.clone())
+        .set_committer(signature)
+        .write()
+        .await
+        .unwrap();
+
+    // Make it the working-copy commit of the workspace
     tx.repo_mut()
         .set_wc_commit(workspace.workspace_name().to_owned(), commit.id().clone())
         .unwrap();
